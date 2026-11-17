@@ -180,6 +180,36 @@ const api = source.slice(source.indexOf('async function api('), source.indexOf('
         subprocess.run(["node", "-"], input=script, text=True, cwd=GATEWAY, check=True,
             env={**os.environ, "FRONTEND_CONTEXTS": json.dumps([(self.original, False), (self.expanded, True)])})
 
+    def test_custom_destination_names_do_not_keep_implicit_local_destinations(self):
+        for context, api in [("Original", self.original_api), ("Reconstruction", self.expanded_api)]:
+            with self.subTest(context=context):
+                body = self.report()
+                if context == "Reconstruction": body["radio"] = 500
+                self.assertEqual(201, request(api, method="POST", body=body)[0])
+                expected = request(api)[2]
+                env = {"ASPNETCORE_ENVIRONMENT": "Reconstruction" if context == "Reconstruction" else "Development",
+                       "ReverseProxy__Clusters__disasters-api__Destinations__external__Address": f"http://127.0.0.1:{api}/"}
+                if context == "Reconstruction":
+                    env["ReverseProxy__Clusters__reconstruction-api__Destinations__external__Address"] = f"http://127.0.0.1:{self.reconstruction_api}/"
+                port, _, log = self.start(GATEWAY, env, "/health")
+                for _ in range(4):
+                    status, _, data = request(port)
+                    self.assertEqual(200, status)
+                    self.assertEqual(expected, data)
+                    if context == "Reconstruction":
+                        status, _, projects = request(port, "/api/reconstruccion/proyectos")
+                        self.assertEqual(200, status)
+                        self.assertEqual(request(self.reconstruction_api, "/api/reconstruccion/proyectos")[2], projects)
+                self.assertNotIn("via local", log.read_text())
+
+    def test_missing_destinations_do_not_fall_back_to_local_apis(self):
+        for environment in ["Development", "Reconstruction"]:
+            with self.subTest(environment=environment):
+                port, _, _ = self.start(GATEWAY, {"ASPNETCORE_ENVIRONMENT": environment}, "/health")
+                self.assertEqual(503, request(port)[0])
+                if environment == "Reconstruction":
+                    self.assertEqual(503, request(port, "/api/reconstruccion/proyectos")[0])
+
     def test_routes_methods_queries_and_cors(self):
         port, _, _ = self.gateway("Reconstruction", {"Cors__AllowedOrigins__0": "http://localhost:3000"})
         self.assertEqual(200, request(port, "/api/reconstruccion/proyectos?disasterId=999999")[0])
