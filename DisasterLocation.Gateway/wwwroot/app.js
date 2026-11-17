@@ -6,6 +6,8 @@ const formStatus = document.querySelector('#form-status');
 const listStatus = document.querySelector('#list-status');
 const latitude = document.querySelector('#latitud');
 const longitude = document.querySelector('#longitud');
+const radius = document.querySelector('#radio');
+let pendingSubmission;
 const colors = ['#27815b', '#738520', '#cb9223', '#d16b30', '#b83d46'];
 let map;
 let markers;
@@ -40,13 +42,17 @@ function updateSelection() {
   if (!map) return;
   if (selection) { selection.remove(); selection = undefined; }
   if (!latitude.value || !longitude.value || !latitude.validity.valid || !longitude.validity.valid) return;
-  selection = L.circleMarker([Number(latitude.value), Number(longitude.value)], {
-    radius: 10, color: '#193c36', fillColor: '#fff', fillOpacity: .9, weight: 3, dashArray: '4 3'
-  }).addTo(map).bindTooltip('Ubicación del nuevo reporte');
+  const radio = radius.value.trim() === '' ? null : Number(radius.value);
+  if (radio !== null && (!Number.isFinite(radio) || radio <= 0 || radio > 1000000)) return;
+  const point = [Number(latitude.value), Number(longitude.value)];
+  const style = { color: '#193c36', fillColor: '#fff', fillOpacity: .9, weight: 3, dashArray: '4 3' };
+  selection = (radio === null ? L.circleMarker(point, { ...style, radius: 10 })
+    : L.circle(point, { ...style, radius: radio })).addTo(map).bindTooltip('Ubicación del nuevo reporte');
 }
 
 latitude.addEventListener('input', updateSelection);
 longitude.addEventListener('input', updateSelection);
+radius.addEventListener('input', updateSelection);
 
 async function api(path, options) {
   const response = await (window.platformFetch ?? window.fetch)(`/api/desastres${path}`, options);
@@ -82,10 +88,10 @@ function render(disasters, fitMap) {
         textElement('p', disaster.ubicacion),
         textElement('p', `Severidad: ${disaster.severidad}/5`),
         textElement('p', disaster.descripcion, 'popup-text'));
-      marker = L.circleMarker([disaster.latitud, disaster.longitud], {
-        radius: 7 + disaster.severidad, color: '#fff', weight: 2,
-        fillColor: colors[disaster.severidad - 1], fillOpacity: .9
-      }).bindPopup(popup).addTo(markers);
+      const point = [disaster.latitud, disaster.longitud];
+      const style = { color: '#fff', weight: 2, fillColor: colors[disaster.severidad - 1], fillOpacity: .9 };
+      marker = (disaster.radio == null ? L.circleMarker(point, { ...style, radius: 7 + disaster.severidad })
+        : L.circle(point, { ...style, radius: disaster.radio })).bindPopup(popup).addTo(markers);
     }
     const article = document.createElement('article');
     article.className = 'report';
@@ -126,19 +132,27 @@ async function loadDisasters(fitMap = true) {
 
 form.addEventListener('submit', async event => {
   event.preventDefault();
+  const radio = radius.value.trim() === '' ? null : Number(radius.value);
+  if (radio !== null && (!Number.isFinite(radio) || radio <= 0 || radio > 1000000)) {
+    setStatus(formStatus, 'El radio debe ser mayor que cero y máximo 1.000.000 metros.', true);
+    return;
+  }
   if (!form.reportValidity()) return;
   const data = new FormData(form);
   const disaster = {
     nombre: data.get('nombre'), ubicacion: data.get('ubicacion'),
     severidad: Number(data.get('severidad')), descripcion: data.get('descripcion'),
-    latitud: Number(data.get('latitud')), longitud: Number(data.get('longitud'))
+    latitud: Number(data.get('latitud')), longitud: Number(data.get('longitud')), radio
   };
+  const content = JSON.stringify(disaster);
+  if (pendingSubmission?.content !== content) pendingSubmission = { content, key: crypto.randomUUID() };
   submitButton.disabled = true;
   setStatus(formStatus, 'Guardando reporte…');
   try {
     const saved = await api('', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(disaster)
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': pendingSubmission.key }, body: content
     });
+    pendingSubmission = undefined;
     form.reset();
     updateSelection();
     setStatus(formStatus, `Reporte #${saved.id} registrado correctamente.`);

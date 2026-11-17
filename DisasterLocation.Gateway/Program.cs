@@ -4,22 +4,12 @@ using System.Net;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
-using Microsoft.Extensions.FileProviders;
 using Yarp.ReverseProxy.Forwarder;
 using Yarp.ReverseProxy.Model;
 using Yarp.ReverseProxy.Transforms;
 
 var builder = WebApplication.CreateBuilder(args);
 var configuration = builder.Configuration;
-var frontend = configuration["Gateway:Frontend"] switch
-{
-    "Original" => "Original",
-    "Reconstruction" => "Reconstruction",
-    _ => throw new InvalidOperationException("Configure Gateway:Frontend como Original o Reconstruction.")
-};
-using var frontendFiles = new PhysicalFileProvider(Path.Combine(builder.Environment.ContentRootPath, "Frontends", frontend));
-builder.Environment.WebRootFileProvider = new CompositeFileProvider(frontendFiles, builder.Environment.WebRootFileProvider);
-
 builder.WebHost.ConfigureKestrel(options =>
 {
     options.AddServerHeader = false;

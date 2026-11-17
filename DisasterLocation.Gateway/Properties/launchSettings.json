@@ -6,15 +6,9 @@
       "dotnetRunMessages": true,
       "launchBrowser": false,
       "applicationUrl": "http://0.0.0.0:5080",
-      "environmentVariables": { "ASPNETCORE_ENVIRONMENT": "Development" }
-    },
-    "reconstruction": {
-      "commandName": "Project",
-      "dotnetRunMessages": true,
-      "launchBrowser": false,
-      "applicationUrl": "http://localhost:5080",
       "environmentVariables": {
-        "ASPNETCORE_ENVIRONMENT": "Reconstruction"
+        "ASPNETCORE_ENVIRONMENT": "Development",
+        "AllowedHosts": "localhost;127.0.0.1;[::1];10.0.2.2"
       }
     }
   }

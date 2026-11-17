@@ -9,6 +9,9 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
+import urllib.request
+import urllib.error
 import socket
 import subprocess
 import tempfile
@@ -97,7 +100,7 @@ class GatewayTests(unittest.TestCase):
             if result.returncode:
                 log.seek(0)
                 raise AssertionError(log.read()[-6000:])
-        cls.disaster_api, cls.original_process, _ = cls.start(BACKEND, {
+        cls.disaster_api, cls.first_process, _ = cls.start(BACKEND, {
             "ConnectionStrings__Disasters": connection, "Security__LocalDemo": "true"}, "/api/desastres")
         cls.peer_api, _, _ = cls.start(BACKEND, {
             "ConnectionStrings__Disasters": connection, "Security__LocalDemo": "true"}, "/api/desastres")
@@ -108,8 +111,8 @@ class GatewayTests(unittest.TestCase):
         cls.reconstruction_api, _, _ = cls.start(RECONSTRUCTION / "Reconstruction.Api", common, "/api/reconstruccion/health")
         cls.secure_api, cls.secure_process, _ = cls.start(RECONSTRUCTION / "Reconstruction.Api",
             {**common, "Security__LocalDemo": "false"}, "/api/reconstruccion/health")
-        cls.original, _, _ = cls.gateway()
-        cls.expanded, _, _ = cls.gateway("Reconstruction")
+        cls.first, _, _ = cls.gateway()
+        cls.second, _, _ = cls.gateway()
 
     @classmethod
     def cleanup(cls):
@@ -146,14 +149,12 @@ class GatewayTests(unittest.TestCase):
         return port, process, log_path
 
     @classmethod
-    def gateway(cls, context="Original", overrides=None):
-        env = {"ASPNETCORE_ENVIRONMENT": "Reconstruction" if context == "Reconstruction" else "Development",
+    def gateway(cls, overrides=None):
+        env = {"ASPNETCORE_ENVIRONMENT": "Development",
                "ReverseProxy__Clusters__disasters-api__Destinations__local__Address":
                    f"http://127.0.0.1:{cls.disaster_api}/",
                "ReverseProxy__Clusters__reconstruction-api__Destinations__local__Address":
                    f"http://127.0.0.1:{cls.reconstruction_api}/"}
-        if context == "Original":
-            del env["ReverseProxy__Clusters__reconstruction-api__Destinations__local__Address"]
         return cls.start(GATEWAY, {**env, **(overrides or {})}, "/health")
 
     @staticmethod
@@ -161,45 +162,40 @@ class GatewayTests(unittest.TestCase):
         return {"nombre": name or str(uuid.uuid4()), "ubicacion": "Bogotá", "severidad": 4,
                 "descripcion": "Gateway validation", "latitud": 4.7, "longitud": -74.0}
 
-    def test_contexts_share_contracts_frontends_and_disasters(self):
+    def test_replicas_share_contracts_frontend_and_disasters(self):
         original_body = self.report()
         expanded_body = {**self.report(), "radio": 500}
-        status, _, original = request(self.original, method="POST", body=original_body)
+        status, _, original = request(self.first, method="POST", body=original_body)
         self.assertEqual(201, status)
         self.assertEqual(set(original_body) | {"id", "radio", "phase", "version"}, set(original))
         self.assertIsNone(original["radio"])
-        status, _, expanded = request(self.expanded, method="POST", body=expanded_body)
+        status, _, expanded = request(self.second, method="POST", body=expanded_body)
         self.assertEqual(201, status)
         self.assertEqual(set(expanded_body) | {"id", "phase", "version"}, set(expanded))
-        self.assertIn(expanded_body["nombre"], [d["nombre"] for d in request(self.original)[2]])
-        self.assertIn(original_body["nombre"], [d["nombre"] for d in request(self.expanded)[2]])
-        self.assertEqual(original, request(self.expanded, f"/api/desastres/{original['id']}")[2])
-        self.assertEqual(expanded, request(self.original, f"/api/desastres/{expanded['id']}")[2])
-        self.assertEqual(200, request(self.original, f"/api/desastres/{original['id']}/fase", "PUT",
+        self.assertIn(expanded_body["nombre"], [d["nombre"] for d in request(self.first)[2]])
+        self.assertIn(original_body["nombre"], [d["nombre"] for d in request(self.second)[2]])
+        self.assertEqual(original, request(self.second, f"/api/desastres/{original['id']}")[2])
+        self.assertEqual(expanded, request(self.first, f"/api/desastres/{expanded['id']}")[2])
+        self.assertEqual(200, request(self.first, f"/api/desastres/{original['id']}/fase", "PUT",
                                      {"phase": "Response", "expectedVersion": 1})[0])
-        self.assertEqual(200, request(self.expanded, f"/api/desastres/{expanded['id']}/fase", "PUT",
+        self.assertEqual(200, request(self.second, f"/api/desastres/{expanded['id']}/fase", "PUT",
                                      {"phase": "Response", "expectedVersion": expanded["version"]})[0])
         key = {"Idempotency-Key": str(uuid.uuid4())}
-        status, _, shared = request(self.original, method="POST", body=self.report("shared-" + str(uuid.uuid4())), headers=key)
+        status, _, shared = request(self.first, method="POST", body=self.report("shared-" + str(uuid.uuid4())), headers=key)
         self.assertEqual(201, status)
         shared_body = {field: shared[field] for field in original_body}
-        status, _, repeated = request(self.expanded, method="POST", body={**shared_body, "radio": None}, headers=key)
+        status, _, repeated = request(self.second, method="POST", body={**shared_body, "radio": None}, headers=key)
         self.assertEqual(200, status)
         self.assertEqual(shared, repeated)
-        self.assertEqual(409, request(self.expanded, method="POST", body={**shared_body, "radio": 500}, headers=key)[0])
-        self.assertEqual(shared, request(self.original, f"/api/desastres/{shared['id']}")[2])
-        for port, context in [(self.original, "Original"), (self.expanded, "Reconstruction")]:
-            for filename in ["index.html"]:
-                self.assertEqual((GATEWAY / "Frontends" / context / filename).read_bytes(), request(port, "/" + filename)[2])
+        self.assertEqual(409, request(self.second, method="POST", body={**shared_body, "radio": 500}, headers=key)[0])
+        self.assertEqual(shared, request(self.first, f"/api/desastres/{shared['id']}")[2])
+        for port in [self.first, self.second]:
             self.assertEqual(request(port, "/index.html")[2], request(port, "/")[2])
-        for filename in ["styles.css", "app.js"]:
-            self.assertEqual((GATEWAY / "wwwroot" / filename).read_bytes(), request(self.original, "/" + filename)[2])
-            self.assertEqual(request(self.original, "/" + filename)[2], request(self.expanded, "/" + filename)[2])
-        self.assertEqual(404, request(self.original, "/session.js")[0])
-        for asset in (GATEWAY / "Frontends/Reconstruction").iterdir():
-            self.assertEqual(asset.read_bytes(), request(self.expanded, "/" + asset.name)[2])
+            for asset in (GATEWAY / "wwwroot").iterdir():
+                if asset.is_file():
+                    self.assertEqual(asset.read_bytes(), request(port, "/" + asset.name)[2])
 
-    def test_shared_frontend_preserves_each_authentication_behavior(self):
+    def test_shared_frontend_preserves_anonymous_and_authenticated_requests(self):
         script = r"""
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -214,8 +210,8 @@ const api = source.slice(source.indexOf('async function api('), source.indexOf('
       return globalThis.fetch(`http://127.0.0.1:${port}${path}`, options);
     };
     const context = vm.createContext({fetch, Headers, window: {fetch, addEventListener() {}},
-      sessionStorage: {getItem() { return 'frontend-header-test'; }}});
-    if (authenticated) vm.runInContext(fs.readFileSync('Frontends/Reconstruction/session.js', 'utf8'), context);
+      sessionStorage: {getItem() { return authenticated ? 'frontend-header-test' : null; }}});
+    vm.runInContext(fs.readFileSync('wwwroot/session.js', 'utf8'), context);
     vm.runInContext(api, context);
     await vm.runInContext("api('')", context);
     assert.equal(calls[0].path, '/api/desastres');
@@ -224,40 +220,117 @@ const api = source.slice(source.indexOf('async function api('), source.indexOf('
 })().catch(error => { console.error(error); process.exitCode = 1; });
 """
         subprocess.run(["node", "-"], input=script, text=True, cwd=GATEWAY, check=True,
-            env={**os.environ, "FRONTEND_CONTEXTS": json.dumps([(self.original, False), (self.expanded, True)])})
+            env={**os.environ, "FRONTEND_CONTEXTS": json.dumps([(self.first, False), (self.second, True)])})
+
+    def test_browser_radius_map_and_retry_identity(self):
+        driver = shutil.which("geckodriver")
+        if driver is None:
+            self.skipTest("Firefox/geckodriver no están disponibles para la prueba de navegador.")
+        port = free_port()
+        log = open(self.folder / "browser.log", "w+")
+        self.logs.append(log)
+        process = subprocess.Popen([driver, "--port", str(port)], stdout=log, stderr=log)
+        self.processes.append(process)
+        def webdriver(method, path, payload=None):
+            data = json.dumps(payload).encode() if payload is not None else None
+            req = urllib.request.Request(f"http://127.0.0.1:{port}" + path, data=data,
+                method=method, headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=60) as response:
+                    return json.load(response)["value"]
+            except urllib.error.HTTPError as error:
+                self.fail(error.read().decode())
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                webdriver("GET", "/status")
+                break
+            except (OSError, urllib.error.URLError):
+                if process.poll() is not None or time.monotonic() > deadline:
+                    self.fail("WebDriver no inició: " + (self.folder / "browser.log").read_text()[-2000:])
+                time.sleep(.1)
+        session = webdriver("POST", "/session", {"capabilities": {"alwaysMatch": {
+            "browserName": "firefox", "pageLoadStrategy": "eager", "moz:firefoxOptions": {"args": ["-headless"]}}}})["sessionId"]
+        prefix = "/session/" + session
+        def script(source, *args):
+            return webdriver("POST", prefix + "/execute/sync", {"script": source, "args": list(args)})
+        def wait_script(source):
+            deadline = time.monotonic() + 20
+            while not script(source):
+                if time.monotonic() > deadline:
+                    self.fail("El navegador no confirmó: " + source)
+                time.sleep(.1)
+        try:
+            webdriver("POST", prefix + "/url", {"url": f"http://127.0.0.1:{self.first}/"})
+            wait_script("return typeof L !== 'undefined' && !document.querySelector('#refresh').disabled")
+            name = "Browser " + str(uuid.uuid4())
+            script("""
+window.submissions = [];
+const send = window.platformFetch;
+window.platformFetch = async (path, options = {}) => {
+  const response = await send(path, options);
+  if (options.method === 'POST') {
+    submissions.push({key: options.headers['Idempotency-Key'], body: JSON.parse(options.body), status: response.status});
+    if (submissions.length === 1) throw new TypeError('Respuesta perdida');
+  }
+  return response;
+};
+for (const [field, value] of Object.entries({nombre: arguments[0], ubicacion:'Bogotá', severidad:'4',
+  descripcion:'Prueba web', latitud:'4.7', longitud:'-74', radio:'1234.75'}))
+  document.getElementById(field).value = value;
+document.querySelector('#submit').click();
+""", name)
+            wait_script("return document.querySelector('#form-status').textContent === 'Respuesta perdida'")
+            script("document.querySelector('#submit').click()")
+            wait_script("return document.querySelector('#form-status').textContent.includes('registrado correctamente') && !document.querySelector('#refresh').disabled")
+            calls = script("return submissions")
+            self.assertEqual([201, 200], [item["status"] for item in calls])
+            self.assertEqual(calls[0]["key"], calls[1]["key"])
+            self.assertEqual(1234.75, calls[0]["body"]["radio"])
+            self.assertEqual(1, len([d for d in request(self.second)[2] if d["nombre"] == name]))
+            self.assertTrue(script("return window.eval(arguments[0])", "markers.getLayers().some(layer => layer instanceof L.Circle && layer.getRadius() === 1234.75)"))
+            script("""
+for (const [field, value] of Object.entries({nombre: arguments[0], ubicacion:'Bogotá', severidad:'4',
+  descripcion:'Prueba web', latitud:'4.7', longitud:'-74', radio:'0'})) document.getElementById(field).value = value;
+document.querySelector('#submit').click();
+""", name + " unknown")
+            self.assertTrue(script("return document.querySelector('#form-status').dataset.error === 'true' && submissions.length === 2"))
+            script("document.querySelector('#radio').value = ''; document.querySelector('#submit').click()")
+            wait_script("return submissions.length === 3 && !document.querySelector('#refresh').disabled")
+            self.assertIsNone(script("return submissions[2].body.radio"))
+            self.assertNotEqual(calls[0]["key"], script("return submissions[2].key"))
+            unknown = next(d for d in request(self.second)[2] if d["nombre"] == name + " unknown")
+            self.assertIsNone(unknown["radio"])
+            self.assertTrue(script("return window.eval(arguments[0])", "markers.getLayers().some(layer => !(layer instanceof L.Circle) && layer.getPopup().getContent().textContent.includes(" + json.dumps(name + " unknown") + "))"))
+            for page in ["reconstruction.html", "access.html", "monitoring.html", "formalization.html", "final-report.html"]:
+                webdriver("POST", prefix + "/url", {"url": f"http://127.0.0.1:{self.second}/{page}"})
+                self.assertTrue(script("return !!document.querySelector('main')"))
+        finally:
+            webdriver("DELETE", prefix)
 
     def test_custom_destination_names_do_not_keep_implicit_local_destinations(self):
-        for context, api in [("Original", self.disaster_api), ("Reconstruction", self.disaster_api)]:
-            with self.subTest(context=context):
-                body = self.report()
-                if context == "Reconstruction": body["radio"] = 500
-                self.assertEqual(201, request(api, method="POST", body=body)[0])
-                expected = request(api)[2]
-                env = {"ASPNETCORE_ENVIRONMENT": "Reconstruction" if context == "Reconstruction" else "Development",
-                       "ReverseProxy__Clusters__disasters-api__Destinations__external__Address": f"http://127.0.0.1:{api}/"}
-                if context == "Reconstruction":
-                    env["ReverseProxy__Clusters__reconstruction-api__Destinations__external__Address"] = f"http://127.0.0.1:{self.reconstruction_api}/"
+        for environment in ["Development", "Production"]:
+            with self.subTest(environment=environment):
+                expected = request(self.disaster_api)[2]
+                env = {"ASPNETCORE_ENVIRONMENT": environment,
+                       "ReverseProxy__Clusters__disasters-api__Destinations__external__Address": f"http://127.0.0.1:{self.disaster_api}/",
+                       "ReverseProxy__Clusters__reconstruction-api__Destinations__external__Address": f"http://127.0.0.1:{self.reconstruction_api}/"}
                 port, _, log = self.start(GATEWAY, env, "/health")
                 for _ in range(4):
-                    status, _, data = request(port)
-                    self.assertEqual(200, status)
-                    self.assertEqual(expected, data)
-                    if context == "Reconstruction":
-                        status, _, projects = request(port, "/api/reconstruccion/proyectos")
-                        self.assertEqual(200, status)
-                        self.assertEqual(request(self.reconstruction_api, "/api/reconstruccion/proyectos")[2], projects)
+                    self.assertEqual((200, expected), (request(port)[0], request(port)[2]))
+                    self.assertEqual(request(self.reconstruction_api, "/api/reconstruccion/proyectos")[2],
+                        request(port, "/api/reconstruccion/proyectos")[2])
                 self.assertNotIn("via local", log.read_text())
 
     def test_missing_destinations_do_not_fall_back_to_local_apis(self):
-        for environment in ["Development", "Reconstruction"]:
+        for environment in ["Development", "Production"]:
             with self.subTest(environment=environment):
                 port, _, _ = self.start(GATEWAY, {"ASPNETCORE_ENVIRONMENT": environment}, "/health")
                 self.assertEqual(503, request(port)[0])
-                if environment == "Reconstruction":
-                    self.assertEqual(503, request(port, "/api/reconstruccion/proyectos")[0])
+                self.assertEqual(503, request(port, "/api/reconstruccion/proyectos")[0])
 
     def test_routes_methods_queries_and_cors(self):
-        port, _, _ = self.gateway("Reconstruction", {"Cors__AllowedOrigins__0": "http://localhost:3000"})
+        port, _, _ = self.gateway(overrides={"Cors__AllowedOrigins__0": "http://localhost:3000"})
         self.assertEqual(200, request(port, "/api/reconstruccion/proyectos?disasterId=999999")[0])
         self.assertEqual([], request(port, "/api/reconstruccion/proyectos?disasterId=999999")[2])
         for path in ["/api/internal", "/api/desastres/internal", "/api/reconstruccion/internal", "/appsettings.json",
@@ -272,7 +345,7 @@ const api = source.slice(source.indexOf('async function api('), source.indexOf('
         self.assertNotIn("access-control-allow-origin", request(port, headers={"Origin": "https://untrusted.invalid"})[1])
 
     def test_authorization_headers_correlation_and_safe_logs(self):
-        port, _, log = self.gateway("Reconstruction", {
+        port, _, log = self.gateway(overrides={
             "ReverseProxy__Clusters__reconstruction-api__Destinations__local__Address": f"http://127.0.0.1:{self.secure_api}/"})
         path = "/api/reconstruccion/proyectos"
         self.assertEqual(401, request(port, path, headers={"X-Actor": "administrator", "X-User-Id": "1"})[0])
@@ -284,6 +357,9 @@ const api = source.slice(source.indexOf('async function api('), source.indexOf('
         _, headers, _ = request(port, headers={"traceparent": f"00-{trace}-{'2' * 16}-01"})
         self.assertEqual(trace, headers["x-trace-id"])
         self.assertNotIn("server", headers)
+        deadline = time.monotonic() + 5
+        while trace not in log.read_text() and time.monotonic() < deadline:
+            time.sleep(.05)
         self.assertNotIn(token, log.read_text())
         self.assertIn(trace, log.read_text())
 
@@ -305,20 +381,20 @@ const api = source.slice(source.indexOf('async function api('), source.indexOf('
         self.assertEqual(200, request(trusted, headers={"X-Forwarded-For": "198.51.100.2"})[0])
 
     def test_hosts_headers_and_request_size_limits(self):
-        self.assertEqual(400, request(self.original, headers={"Host": "untrusted.invalid"})[0])
-        self.assertEqual(200, request(self.original, headers={"X-Forwarded-Host": "untrusted.invalid",
+        self.assertEqual(400, request(self.first, headers={"Host": "untrusted.invalid"})[0])
+        self.assertEqual(200, request(self.first, headers={"X-Forwarded-Host": "untrusted.invalid",
             "X-Forwarded-Proto": "https", "Forwarded": "for=203.0.113.1;host=untrusted.invalid"})[0])
         port, _, _ = self.gateway(overrides={"Kestrel__Limits__MaxRequestHeadersTotalSize": "1024",
                                            "Kestrel__Limits__MaxRequestBodySize": "1024"})
         self.assertEqual(431, request(port, headers={"X-Padding": "x" * 2048})[0])
         name = str(uuid.uuid4())
         self.assertEqual(413, request(port, method="POST", body={**self.report(name), "padding": "x" * 2048})[0])
-        self.assertNotIn(name, [d["nombre"] for d in request(self.original)[2]])
+        self.assertNotIn(name, [d["nombre"] for d in request(self.first)[2]])
 
     def test_timeout_and_concurrency_limit(self):
         port, _, _ = self.gateway(overrides={"Traffic__ConcurrentRequests": "1",
                                             "ReverseProxy__Clusters__disasters-api__HttpRequest__ActivityTimeout": "00:00:01"})
-        os.kill(self.original_process.pid, signal.SIGSTOP)
+        os.kill(self.first_process.pid, signal.SIGSTOP)
         try:
             with ThreadPoolExecutor(max_workers=1) as pool:
                 pending = pool.submit(request, port)
@@ -327,11 +403,11 @@ const api = source.slice(source.indexOf('async function api('), source.indexOf('
                 self.assertEqual(429, request(port)[0])
                 self.assertEqual(504, pending.result(timeout=5)[0])
         finally:
-            os.kill(self.original_process.pid, signal.SIGCONT)
+            os.kill(self.first_process.pid, signal.SIGCONT)
         self.assertEqual(200, request(port)[0])
 
     def test_active_health_and_unavailable_destination(self):
-        port, _, _ = self.gateway("Reconstruction", {
+        port, _, _ = self.gateway(overrides={
             "ReverseProxy__Clusters__reconstruction-api__Destinations__local__Address": f"http://127.0.0.1:{self.secure_api}/",
             "ReverseProxy__Clusters__reconstruction-api__HealthCheck__Active__Interval": "00:00:00.2",
             "ReverseProxy__Clusters__reconstruction-api__HealthCheck__Active__Timeout": "00:00:00.15",
@@ -341,6 +417,7 @@ const api = source.slice(source.indexOf('async function api('), source.indexOf('
             time.sleep(.8)
             self.assertEqual(503, request(port, "/api/reconstruccion/health")[0])
             self.assertEqual(200, request(port, "/health")[0])
+            self.assertEqual(200, request(port)[0])
         finally:
             os.kill(self.secure_process.pid, signal.SIGCONT)
         wait_ready(port, "/api/reconstruccion/health", self.processes[-1])
@@ -368,13 +445,13 @@ const api = source.slice(source.indexOf('async function api('), source.indexOf('
         self.assertIn("via local", content)
 
     def test_full_size_attachment_is_forwarded_without_session_affinity(self):
-        _, _, disaster = request(self.expanded, method="POST", body={**self.report(), "radio": 500})
+        _, _, disaster = request(self.second, method="POST", body={**self.report(), "radio": 500})
         for phase in ["Response", "Recovery"]:
-            status, _, disaster = request(self.expanded, f"/api/desastres/{disaster['id']}/fase", "PUT",
+            status, _, disaster = request(self.second, f"/api/desastres/{disaster['id']}/fase", "PUT",
                 {"phase": phase, "expectedVersion": disaster["version"]})
             self.assertEqual(200, status)
-        _, _, proposals = request(self.expanded, "/api/reconstruccion/propuestas/generar", "POST", {"disasterId": disaster["id"]})
-        status, _, project = request(self.expanded, "/api/reconstruccion/proyectos", "POST",
+        _, _, proposals = request(self.second, "/api/reconstruccion/propuestas/generar", "POST", {"disasterId": disaster["id"]})
+        status, _, project = request(self.second, "/api/reconstruccion/proyectos", "POST",
             {"proposalId": proposals[0]["id"], "expectedVersion": proposals[0]["version"]})
         self.assertEqual(200, status)
         path = f"/api/reconstruccion/proyectos/{project['id']}/adjuntos"
@@ -382,9 +459,9 @@ const api = source.slice(source.indexOf('async function api('), source.indexOf('
         data = b"%PDF-1.4\n" + b"x" * (20 * 1024 * 1024 - 9)
         raw = (f'--{boundary}\r\nContent-Disposition: form-data; name="category"\r\n\r\nevidence\r\n'
                f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="report.pdf"\r\nContent-Type: application/pdf\r\n\r\n').encode() + data + f'\r\n--{boundary}--\r\n'.encode()
-        status, _, attachment = request(self.expanded, path, "POST", raw, {"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        status, _, attachment = request(self.second, path, "POST", raw, {"Content-Type": f"multipart/form-data; boundary={boundary}"})
         self.assertEqual(200, status)
-        replica, _, _ = self.gateway("Reconstruction")
+        replica, _, _ = self.gateway()
         status, _, downloaded = request(replica, path + "/" + attachment["id"])
         self.assertEqual(200, status)
         self.assertEqual(hashlib.sha256(data).digest(), hashlib.sha256(downloaded).digest())
