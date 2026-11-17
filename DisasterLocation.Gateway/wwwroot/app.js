@@ -49,7 +49,7 @@ latitude.addEventListener('input', updateSelection);
 longitude.addEventListener('input', updateSelection);
 
 async function api(path, options) {
-  const response = await fetch(`/api/desastres${path}`, options);
+  const response = await (window.platformFetch ?? window.fetch)(`/api/desastres${path}`, options);
   if (!response.ok) {
     const problem = await response.json().catch(() => null);
     const messages = problem?.errors ? Object.values(problem.errors).flat().join(' ') : null;
