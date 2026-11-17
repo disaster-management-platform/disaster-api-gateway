@@ -1,5 +1,8 @@
-"""Gateway checks with real APIs, temporary SQLite databases and Node.js for shared frontend requests."""
+"""Gateway checks with real APIs, temporary PostgreSQL databases and Node.js for shared frontend requests."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, closing, contextmanager
+import psycopg2
+from psycopg2 import sql
 import hashlib
 from http.client import HTTPConnection
 import json
@@ -17,6 +20,28 @@ ROOT = Path(__file__).resolve().parents[1]
 GATEWAY = ROOT / "DisasterLocation.Gateway"
 BACKEND = Path(os.environ.get("BACKEND_PROJECT_PATH", ROOT.parent / "disaster-backend-offline/DisasterLocation"))
 RECONSTRUCTION = Path(os.environ.get("RECONSTRUCTION_REPOSITORY_PATH", ROOT.parent / "reconstruction-business-layer"))
+
+
+@contextmanager
+def test_database():
+    settings = psycopg2.extensions.parse_dsn(os.environ["TEST_POSTGRES_DSN"])
+    if not settings.get("host", "").startswith("/"):
+        raise ValueError("Las pruebas requieren un socket PostgreSQL local, nunca Supabase.")
+    name = "gateway_test_" + uuid.uuid4().hex
+    with closing(psycopg2.connect(**settings)) as admin:
+        admin.autocommit = True
+        with admin.cursor() as cursor:
+            cursor.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+        try:
+            settings["dbname"] = name
+            def escape(value):
+                return '"' + value.replace('"', '""') + '"'
+            yield ";".join(key + "=" + escape(settings[source]) for key, source in
+                [("Host", "host"), ("Port", "port"), ("Database", "dbname"), ("Username", "user"), ("Password", "password")]
+                if source in settings)
+        finally:
+            with admin.cursor() as cursor:
+                cursor.execute(sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name)))
 
 
 def free_port():
@@ -60,14 +85,25 @@ class GatewayTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix="gateway-tests-")
         cls.folder = Path(cls.temp.name)
+        cls.databases = ExitStack()
         cls.processes = []
         cls.logs = []
         cls.addClassCleanup(cls.cleanup)
+        original = cls.databases.enter_context(test_database())
+        expanded = cls.databases.enter_context(test_database())
+        for connection in [original, expanded]:
+            with tempfile.TemporaryFile(mode="w+") as log:
+                result = subprocess.run(["dotnet", str(BACKEND / "bin/Debug/net10.0/DisasterLocation.dll"),
+                    "--Database:Migrate=true"], cwd=BACKEND,
+                    env={**os.environ, "ConnectionStrings__Disasters": connection}, stdout=log, stderr=log, timeout=60)
+                if result.returncode:
+                    log.seek(0)
+                    raise AssertionError(log.read()[-6000:])
         cls.original_api, cls.original_process, _ = cls.start(BACKEND, {
-            "ConnectionStrings__Disasters": f"Data Source={cls.folder / 'original.db'}"}, "/api/desastres")
+            "ConnectionStrings__Disasters": original}, "/api/desastres")
         cls.peer_api, _, _ = cls.start(BACKEND, {
-            "ConnectionStrings__Disasters": f"Data Source={cls.folder / 'original.db'}"}, "/api/desastres")
-        common = {"ConnectionStrings__Disasters": f"Data Source={cls.folder / 'expanded.db'}",
+            "ConnectionStrings__Disasters": original}, "/api/desastres")
+        common = {"ConnectionStrings__Disasters": expanded,
                   "Security__LocalDemo": "true", "Messaging__Enabled": "false",
                   "Reconstruction__DemoExternalData": "true", "Attachments__Directory": str(cls.folder / "attachments")}
         cls.expanded_api, _, _ = cls.start(RECONSTRUCTION / "DisasterLocation", common, "/api/desastres")
@@ -91,6 +127,7 @@ class GatewayTests(unittest.TestCase):
                     process.wait()
         for log in cls.logs:
             log.close()
+        cls.databases.close()
         cls.temp.cleanup()
 
     @classmethod
