@@ -89,25 +89,22 @@ class GatewayTests(unittest.TestCase):
         cls.processes = []
         cls.logs = []
         cls.addClassCleanup(cls.cleanup)
-        original = cls.databases.enter_context(test_database())
-        expanded = cls.databases.enter_context(test_database())
-        for connection in [original, expanded]:
-            with tempfile.TemporaryFile(mode="w+") as log:
-                result = subprocess.run(["dotnet", str(BACKEND / "bin/Debug/net10.0/DisasterLocation.dll"),
+        connection = cls.databases.enter_context(test_database())
+        with tempfile.TemporaryFile(mode="w+") as log:
+            result = subprocess.run(["dotnet", str(BACKEND / "bin/Debug/net10.0/DisasterLocation.dll"),
                     "--Database:Migrate=true"], cwd=BACKEND,
                     env={**os.environ, "ConnectionStrings__Disasters": connection}, stdout=log, stderr=log, timeout=60)
-                if result.returncode:
-                    log.seek(0)
-                    raise AssertionError(log.read()[-6000:])
-        cls.original_api, cls.original_process, _ = cls.start(BACKEND, {
-            "ConnectionStrings__Disasters": original}, "/api/desastres")
+            if result.returncode:
+                log.seek(0)
+                raise AssertionError(log.read()[-6000:])
+        cls.disaster_api, cls.original_process, _ = cls.start(BACKEND, {
+            "ConnectionStrings__Disasters": connection, "Security__LocalDemo": "true"}, "/api/desastres")
         cls.peer_api, _, _ = cls.start(BACKEND, {
-            "ConnectionStrings__Disasters": original}, "/api/desastres")
-        common = {"ConnectionStrings__Disasters": expanded,
+            "ConnectionStrings__Disasters": connection, "Security__LocalDemo": "true"}, "/api/desastres")
+        common = {"ConnectionStrings__Disasters": connection,
                   "Security__LocalDemo": "true", "Messaging__Enabled": "false",
                   "Reconstruction__DemoExternalData": "true", "Attachments__Directory": str(cls.folder / "attachments")}
-        cls.expanded_api, _, _ = cls.start(RECONSTRUCTION / "DisasterLocation", common, "/api/desastres")
-        common["ExternalApis__Disasters"] = f"http://127.0.0.1:{cls.expanded_api}/"
+        common["ExternalApis__Disasters"] = f"http://127.0.0.1:{cls.disaster_api}/"
         cls.reconstruction_api, _, _ = cls.start(RECONSTRUCTION / "Reconstruction.Api", common, "/api/reconstruccion/health")
         cls.secure_api, cls.secure_process, _ = cls.start(RECONSTRUCTION / "Reconstruction.Api",
             {**common, "Security__LocalDemo": "false"}, "/api/reconstruccion/health")
@@ -152,7 +149,7 @@ class GatewayTests(unittest.TestCase):
     def gateway(cls, context="Original", overrides=None):
         env = {"ASPNETCORE_ENVIRONMENT": "Reconstruction" if context == "Reconstruction" else "Development",
                "ReverseProxy__Clusters__disasters-api__Destinations__local__Address":
-                   f"http://127.0.0.1:{cls.expanded_api if context == 'Reconstruction' else cls.original_api}/",
+                   f"http://127.0.0.1:{cls.disaster_api}/",
                "ReverseProxy__Clusters__reconstruction-api__Destinations__local__Address":
                    f"http://127.0.0.1:{cls.reconstruction_api}/"}
         if context == "Original":
@@ -164,21 +161,33 @@ class GatewayTests(unittest.TestCase):
         return {"nombre": name or str(uuid.uuid4()), "ubicacion": "Bogotá", "severidad": 4,
                 "descripcion": "Gateway validation", "latitud": 4.7, "longitud": -74.0}
 
-    def test_contexts_preserve_contracts_frontends_and_stores(self):
+    def test_contexts_share_contracts_frontends_and_disasters(self):
         original_body = self.report()
         expanded_body = {**self.report(), "radio": 500}
         status, _, original = request(self.original, method="POST", body=original_body)
         self.assertEqual(201, status)
-        self.assertEqual(set(original_body) | {"id"}, set(original))
+        self.assertEqual(set(original_body) | {"id", "radio", "phase", "version"}, set(original))
+        self.assertIsNone(original["radio"])
         status, _, expanded = request(self.expanded, method="POST", body=expanded_body)
         self.assertEqual(201, status)
         self.assertEqual(set(expanded_body) | {"id", "phase", "version"}, set(expanded))
-        self.assertNotIn(expanded_body["nombre"], [d["nombre"] for d in request(self.original)[2]])
-        self.assertNotIn(original_body["nombre"], [d["nombre"] for d in request(self.expanded)[2]])
-        self.assertEqual(404, request(self.original, f"/api/desastres/{original['id']}/fase", "PUT",
+        self.assertIn(expanded_body["nombre"], [d["nombre"] for d in request(self.original)[2]])
+        self.assertIn(original_body["nombre"], [d["nombre"] for d in request(self.expanded)[2]])
+        self.assertEqual(original, request(self.expanded, f"/api/desastres/{original['id']}")[2])
+        self.assertEqual(expanded, request(self.original, f"/api/desastres/{expanded['id']}")[2])
+        self.assertEqual(200, request(self.original, f"/api/desastres/{original['id']}/fase", "PUT",
                                      {"phase": "Response", "expectedVersion": 1})[0])
         self.assertEqual(200, request(self.expanded, f"/api/desastres/{expanded['id']}/fase", "PUT",
                                      {"phase": "Response", "expectedVersion": expanded["version"]})[0])
+        key = {"Idempotency-Key": str(uuid.uuid4())}
+        status, _, shared = request(self.original, method="POST", body=self.report("shared-" + str(uuid.uuid4())), headers=key)
+        self.assertEqual(201, status)
+        shared_body = {field: shared[field] for field in original_body}
+        status, _, repeated = request(self.expanded, method="POST", body={**shared_body, "radio": None}, headers=key)
+        self.assertEqual(200, status)
+        self.assertEqual(shared, repeated)
+        self.assertEqual(409, request(self.expanded, method="POST", body={**shared_body, "radio": 500}, headers=key)[0])
+        self.assertEqual(shared, request(self.original, f"/api/desastres/{shared['id']}")[2])
         for port, context in [(self.original, "Original"), (self.expanded, "Reconstruction")]:
             for filename in ["index.html"]:
                 self.assertEqual((GATEWAY / "Frontends" / context / filename).read_bytes(), request(port, "/" + filename)[2])
@@ -218,7 +227,7 @@ const api = source.slice(source.indexOf('async function api('), source.indexOf('
             env={**os.environ, "FRONTEND_CONTEXTS": json.dumps([(self.original, False), (self.expanded, True)])})
 
     def test_custom_destination_names_do_not_keep_implicit_local_destinations(self):
-        for context, api in [("Original", self.original_api), ("Reconstruction", self.expanded_api)]:
+        for context, api in [("Original", self.disaster_api), ("Reconstruction", self.disaster_api)]:
             with self.subTest(context=context):
                 body = self.report()
                 if context == "Reconstruction": body["radio"] = 500
@@ -345,7 +354,7 @@ const api = source.slice(source.indexOf('async function api('), source.indexOf('
         settings = {"ReverseProxy__Clusters__disasters-api__Destinations__peer__Address": f"http://127.0.0.1:{self.peer_api}/"}
         first, _, log = self.gateway(overrides=settings)
         second, _, _ = self.gateway(overrides=settings)
-        body = self.report()
+        body = {**self.report(), "radio": 500}
         headers = {"Idempotency-Key": str(uuid.uuid4())}
         status, _, saved = request(first, method="POST", body=body, headers=headers)
         self.assertEqual(201, status)
