@@ -281,8 +281,25 @@ for (const [field, value] of Object.entries({nombre: arguments[0], ubicacion:'Bo
 document.querySelector('#submit').click();
 """, name)
             wait_script("return document.querySelector('#form-status').textContent === 'Respuesta perdida'")
-            script("document.querySelector('#submit').click()")
+            first = script("return submissions[0]")
+            self.assertTrue(script("return typeof crypto.randomUUID === 'function' && window.isSecureContext"))
+            script("document.querySelector('#nombre').value = 'Cambio incierto'; document.querySelector('#submit').click()")
+            self.assertTrue(script("return submissions.length === 1 && document.querySelector('#form-status').textContent.includes('anterior sigue sin confirmar')"))
+            webdriver("POST", prefix + "/url", {"url": f"http://127.0.0.1:{self.first}/"})
+            wait_script("return !document.querySelector('#refresh').disabled")
+            self.assertEqual(name, script("return document.querySelector('#nombre').value"))
+            script("""
+window.submissions = [arguments[0]];
+const send = window.platformFetch;
+window.platformFetch = async (path, options = {}) => {
+  const response = await send(path, options);
+  if (options.method === 'POST') submissions.push({key: options.headers['Idempotency-Key'], body: JSON.parse(options.body), status: response.status});
+  return response;
+};
+document.querySelector('#form-status + button').click();
+""", first)
             wait_script("return document.querySelector('#form-status').textContent.includes('registrado correctamente') && !document.querySelector('#refresh').disabled")
+            self.assertIsNone(script("return sessionStorage.getItem('disaster-pending-submission')"))
             calls = script("return submissions")
             self.assertEqual([201, 200], [item["status"] for item in calls])
             self.assertEqual(calls[0]["key"], calls[1]["key"])
@@ -295,10 +312,11 @@ for (const [field, value] of Object.entries({nombre: arguments[0], ubicacion:'Bo
 document.querySelector('#submit').click();
 """, name + " unknown")
             self.assertTrue(script("return document.querySelector('#form-status').dataset.error === 'true' && submissions.length === 2"))
-            script("document.querySelector('#radio').value = ''; document.querySelector('#submit').click()")
+            script("Object.defineProperty(crypto, 'randomUUID', {value: undefined}); document.querySelector('#radio').value = ''; document.querySelector('#submit').click()")
             wait_script("return submissions.length === 3 && !document.querySelector('#refresh').disabled")
             self.assertIsNone(script("return submissions[2].body.radio"))
             self.assertNotEqual(calls[0]["key"], script("return submissions[2].key"))
+            self.assertEqual(4, uuid.UUID(script("return submissions[2].key")).version)
             unknown = next(d for d in request(self.second)[2] if d["nombre"] == name + " unknown")
             self.assertIsNone(unknown["radio"])
             self.assertTrue(script("return window.eval(arguments[0])", "markers.getLayers().some(layer => !(layer instanceof L.Circle) && layer.getPopup().getContent().textContent.includes(" + json.dumps(name + " unknown") + "))"))
