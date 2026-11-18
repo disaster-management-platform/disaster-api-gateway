@@ -166,6 +166,25 @@ class GatewayTests(unittest.TestCase):
         return {"nombre": name or str(uuid.uuid4()), "ubicacion": "Bogotá", "severidad": 4,
                 "descripcion": "Gateway validation", "latitud": 4.7, "longitud": -74.0}
 
+    def test_reports_organizations_geography_and_alerts_use_explicit_routes(self):
+        status, _, report = request(self.first, "/api/reportes-desastre", "POST", {
+            "sourceKind": "External", "sourceId": "test-canonical-provider", "sourceReportId": str(uuid.uuid4()),
+            "content": {"measurement": 3}, "createPreliminary": True, "disaster": self.report()})
+        self.assertEqual(201, status)
+        disaster_id = report["disasterId"]
+        self.assertEqual(report["id"], request(self.first, f"/api/reportes-desastre/{report['id']}")[2]["id"])
+        self.assertEqual("Detected", request(self.second, f"/api/desastres/{disaster_id}")[2]["phase"])
+        self.assertEqual(report["id"], request(self.second, f"/api/desastres/{disaster_id}/reportes")[2][0]["id"])
+        self.assertEqual(200, request(self.first, f"/api/desastres/{disaster_id}/organismos", "PUT", {
+            "expectedVersion": 1, "registeringOrganizationId": "eden:registrar:1", "emergencyResponsibleId": "person:4",
+            "organizations": [{"organizationId": "eden:12", "responsibility": "Rescate"}]})[0])
+        self.assertEqual(200, request(self.first, f"/api/desastres/{disaster_id}/geografia", "PUT", {
+            "expectedVersion": 2, "sourceId": "gis:canonical", "geography": {"polygon": {"type": "Polygon",
+                "coordinates": [[[-74.1, 4.6], [-74.0, 4.6], [-74.0, 4.7], [-74.1, 4.6]]]}, "municipalities": ["Bogotá"]}})[0])
+        alerts = request(self.second, f"/api/desastres/{disaster_id}/alertas")[2]
+        self.assertEqual(["DisasterDetected", "DisasterAreaChanged"], [x["eventType"] for x in alerts])
+        self.assertEqual(404, request(self.first, f"/api/desastres/{disaster_id}/outbox-internal")[0])
+
     def test_batch_delta_limits_and_replica_retries_preserve_individual_outcomes(self):
         operation = {"clientRequestId": str(uuid.uuid4()), "disaster": self.report()}
         body = {"operations": [operation]}
@@ -422,15 +441,32 @@ document.querySelector('#submit').click();
             wait_script("return Array.from(document.querySelector('#disasterTypeId').options).some(option => option.textContent === arguments[0])", type_name)
             type_id = script("return Array.from(document.querySelector('#disasterTypeId').options).find(option => option.textContent === arguments[0]).value", type_name)
             managed_name = name + " managed"
-            script("""
-for (const [field, value] of Object.entries({nombre: arguments[0], ubicacion:'Bogotá', severidad:'5',
-  descripcion:'Administración web', latitud:'4.7', longitud:'-74', radio:'1100', disasterTypeId:arguments[1],
-  startedAt:'2026-11-17T12:00:00', attentionLevel:'1'})) document.getElementById(field).value = value;
-document.querySelector('#submit').click();
-""", managed_name, type_id)
+            precise_body = {**self.report(managed_name), "radio": 1100, "disasterTypeId": int(type_id), "attentionLevel": 1,
+                "startedAt": "2026-11-17T12:00:00.123456Z"}
+            script("sessionStorage.setItem('disaster-pending-submission', JSON.stringify(arguments[0]))",
+                {"key": str(uuid.uuid4()), "content": json.dumps(precise_body, separators=(",", ":"))})
+            webdriver("POST", prefix + "/url", {"url": f"http://127.0.0.1:{self.first}/"})
+            wait_script("return !document.querySelector('#refresh').disabled")
+            script("document.querySelector('#form-status + button').click()")
             wait_script("return document.querySelector('#form-status').textContent.includes('registrado correctamente') && !document.querySelector('#refresh').disabled")
             managed = next(item for item in request(self.first)[2] if item["nombre"] == managed_name)
+            self.assertTrue(managed["startedAt"].endswith(".123456+00:00") or managed["startedAt"].endswith(".123456Z"))
+            # Re-render with the catalogue deliberately absent, then refresh it in place.
+            script("window.eval('disasterTypes = []'); render(arguments[0], false)", request(self.first)[2])
             self.assertEqual(int(type_id), managed["disasterTypeId"])
+            script("""
+const article = Array.from(document.querySelectorAll('.report')).find(node => node.querySelector('h3').textContent === arguments[0]);
+const edit = article.querySelector('form'); edit.elements.namedItem('nombre').value = 'Edición que se conserva';
+window.catalogFetch = window.platformFetch;
+window.platformFetch = async (path, options) => {
+  if (path === '/api/tipos-desastre') await new Promise(resolve => setTimeout(resolve, 100));
+  return catalogFetch(path, options);
+};
+loadTypes();
+""", managed_name)
+            wait_script("return window.eval('disasterTypes.length > 0') && Array.from(document.querySelectorAll('select[data-type-selector]')).every(select => Array.from(select.options).some(option => option.value === arguments[0]))", type_id)
+            self.assertTrue(script("const article = Array.from(document.querySelectorAll('.report')).find(node => node.querySelector('h3').textContent === arguments[0]); return article.querySelector('form').elements.namedItem('nombre').value === 'Edición que se conserva'", managed_name))
+            script("window.platformFetch = window.catalogFetch")
             script("""
 const article = Array.from(document.querySelectorAll('.report')).find(node => node.querySelector('h3').textContent === arguments[0]);
 const details = article.querySelector('details'); details.open = true;
@@ -440,6 +476,7 @@ edit.elements.namedItem('attentionLevel').value = '4'; edit.querySelector('butto
             wait_script("return Array.from(document.querySelectorAll('.report h3')).some(node => node.textContent === arguments[0])", managed_name + " updated")
             current = request(self.first, f"/api/desastres/{managed['id']}")[2]
             self.assertEqual(2, current["version"]); self.assertEqual(4, current["attentionLevel"])
+            self.assertEqual(managed["startedAt"], current["startedAt"])
             script("""
 const article = Array.from(document.querySelectorAll('.report')).find(node => node.querySelector('h3').textContent === arguments[0]);
 const details = article.querySelectorAll('details')[1]; details.open = true;
@@ -451,7 +488,7 @@ phase.querySelector('input[type=checkbox]').checked = true; phase.querySelector(
             closed = request(self.first, f"/api/desastres/{managed['id']}")[2]; self.assertEqual("Closed", closed["phase"])
             script("""
 const article = Array.from(document.querySelectorAll('.report')).find(node => node.querySelector('h3').textContent === arguments[0]);
-article.querySelector('details:last-child').open = true;
+Array.from(article.querySelectorAll('details')).find(item => item.querySelector('summary').textContent === 'Consultar historial').open = true;
 """, managed_name + " updated")
             wait_script("return document.querySelector('#disaster-list').textContent.includes('commitmentsConfirmed')")
             script("Array.from(document.querySelectorAll('#type-list p')).find(node => node.textContent.includes(arguments[0])).querySelector('button').click()", type_name)
