@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
@@ -28,6 +30,26 @@ builder.Services.Configure<ForwardedHeadersOptions>(options =>
     foreach (var host in (configuration["AllowedHosts"] ?? "").Split(';', StringSplitOptions.RemoveEmptyEntries))
         options.AllowedHosts.Add(host);
 });
+var authority = configuration["Security:Authority"];
+if (!string.IsNullOrWhiteSpace(authority))
+{
+    if (!Uri.TryCreate(authority, UriKind.Absolute, out var issuer) || issuer.Scheme != "https")
+        throw new InvalidOperationException("Security authority must use HTTPS.");
+    var audiences = configuration.GetSection("Security:Audiences").Get<string[]>() ?? [];
+    if (audiences.Length == 0) throw new InvalidOperationException("Security audiences are required.");
+    builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(options =>
+    {
+        options.Authority = authority;
+        options.RequireHttpsMetadata = true;
+        options.MapInboundClaims = false;
+        options.TokenValidationParameters.ValidAudiences = audiences;
+        options.TokenValidationParameters.ValidateAudience = true;
+        options.TokenValidationParameters.ValidateIssuer = true;
+        options.TokenValidationParameters.ValidateLifetime = true;
+        options.TokenValidationParameters.RoleClaimType = "role";
+        options.TokenValidationParameters.NameClaimType = "sub";
+    });
+}
 builder.Services.AddReverseProxy()
     .LoadFromConfig(configuration.GetSection("ReverseProxy"))
     .AddTransforms(context =>
@@ -115,6 +137,20 @@ app.UseExceptionHandler(handler => handler.Run(context =>
     Results.Problem(statusCode: 500, title: "Gateway error").ExecuteAsync(context)));
 app.UseRouting();
 app.UseCors();
+if (!string.IsNullOrWhiteSpace(authority))
+{
+    app.UseAuthentication();
+    app.Use(async (context, next) =>
+    {
+        if (context.Request.Headers.ContainsKey("Authorization") && !(await context.AuthenticateAsync()).Succeeded)
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            context.Response.Headers.WWWAuthenticate = "Bearer";
+            return;
+        }
+        await next(context);
+    });
+}
 app.UseRequestTimeouts();
 app.UseRateLimiter();
 app.UseDefaultFiles();
