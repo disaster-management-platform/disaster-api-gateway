@@ -4,6 +4,7 @@ from contextlib import ExitStack, closing, contextmanager
 import psycopg2
 from psycopg2 import sql
 import hashlib
+import re
 from http.client import HTTPConnection
 import json
 import os
@@ -95,6 +96,7 @@ class GatewayTests(unittest.TestCase):
         cls.logs = []
         cls.addClassCleanup(cls.cleanup)
         connection = cls.databases.enter_context(test_database())
+        cls.connection = connection
         with tempfile.TemporaryFile(mode="w+") as log:
             result = subprocess.run(["dotnet", str(BACKEND / "bin/Debug/net10.0/DisasterLocation.dll"),
                     "--Database:Migrate=true"], cwd=BACKEND,
@@ -163,6 +165,54 @@ class GatewayTests(unittest.TestCase):
     def report(name=None):
         return {"nombre": name or str(uuid.uuid4()), "ubicacion": "Bogotá", "severidad": 4,
                 "descripcion": "Gateway validation", "latitud": 4.7, "longitud": -74.0}
+
+    def test_batch_delta_limits_and_replica_retries_preserve_individual_outcomes(self):
+        operation = {"clientRequestId": str(uuid.uuid4()), "disaster": self.report()}
+        body = {"operations": [operation]}
+        status, _, first = request(self.first, "/api/desastres/batch", "POST", body)
+        self.assertEqual(200, status); self.assertEqual("Created", first["results"][0]["status"])
+        status, _, repeated = request(self.second, "/api/desastres/batch", "POST", body)
+        self.assertEqual(200, status); self.assertEqual("AlreadyProcessed", repeated["results"][0]["status"])
+        self.assertEqual(first["results"][0]["disaster"], repeated["results"][0]["disaster"])
+        self.assertEqual(400, request(self.first, "/api/desastres/batch", "POST", {"operations": [operation] * 51})[0])
+        self.assertEqual(413, request(self.first, "/api/desastres/batch", "POST", {"operations": [], "padding": "x" * 1048576})[0])
+        self.assertEqual(200, request(self.first, "/api/desastres/sync?limit=1")[0])
+        self.assertEqual(400, request(self.first, "/api/desastres/sync?limit=51")[0])
+        limited, _, _ = self.gateway({"Traffic__BatchOperationBudget": "50"})
+        self.assertEqual(200, request(limited, "/api/desastres/batch", "POST", body)[0])
+        status, headers, _ = request(limited, "/api/desastres/batch", "POST", body)
+        self.assertEqual(429, status); self.assertIn("retry-after", headers)
+        self.assertEqual(200, request(limited)[0])
+
+    def test_bulk_concurrency_and_timeouts_leave_interactive_capacity_available(self):
+        values = dict(re.findall(r'([^;=]+)="((?:[^"]|"")*)"', self.connection))
+        settings = {target: values[source].replace('""', '"') for source, target in
+                    [("Host", "host"), ("Port", "port"), ("Database", "dbname"), ("Username", "user")] if source in values}
+        body = lambda: {"operations": [{"clientRequestId": str(uuid.uuid4()), "disaster": self.report()}]}
+        with closing(psycopg2.connect(**settings)) as lock:
+            with lock.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(6041,1)")
+                with ThreadPoolExecutor(2) as pool:
+                    pending = [pool.submit(request, self.first, "/api/desastres/batch", "POST", body()) for _ in range(2)]
+                    deadline = time.monotonic() + 5
+                    with closing(psycopg2.connect(**settings)) as monitor, monitor.cursor() as state:
+                        while True:
+                            state.execute("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event='advisory'")
+                            if state.fetchone()[0] >= 2: break
+                            self.assertLess(time.monotonic(), deadline)
+                            monitor.commit(); time.sleep(.05)
+                    self.assertEqual(429, request(self.first, "/api/desastres/batch", "POST", body())[0])
+                    self.assertEqual(200, request(self.first)[0])
+                    lock.commit()
+                    self.assertEqual([200, 200], [future.result()[0] for future in pending])
+                timed, _, _ = self.gateway({"ReverseProxy__Routes__disaster-batch__Timeout": "00:00:00.2"})
+                cursor.execute("SELECT pg_advisory_xact_lock(6041,1)")
+                operation = body()
+                timeout_result = request(timed, "/api/desastres/batch", "POST", operation)
+                self.assertEqual(504, timeout_result[0], timeout_result[2])
+                self.assertEqual(200, request(self.first)[0])
+                lock.commit()
+                self.assertEqual(200, request(self.second, "/api/desastres/batch", "POST", operation)[0])
 
     def test_replicas_share_contracts_frontend_and_disasters(self):
         original_body = self.report()
