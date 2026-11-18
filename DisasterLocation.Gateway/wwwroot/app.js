@@ -16,8 +16,13 @@ retryButton.hidden = true;
 formStatus.after(retryButton);
 function restoreSubmission() {
   const disaster = JSON.parse(pendingSubmission.content);
-  for (const field of ['nombre', 'ubicacion', 'severidad', 'descripcion', 'latitud', 'longitud', 'radio'])
-    form.elements.namedItem(field).value = disaster[field] ?? '';
+  for (const field of ['nombre', 'ubicacion', 'severidad', 'descripcion', 'latitud', 'longitud', 'radio', 'disasterTypeId', 'startedAt', 'attentionLevel'])
+  {
+    const input = form.elements.namedItem(field);
+    if (field === 'disasterTypeId' && disaster[field] != null && !Array.from(input.options).some(option => option.value === String(disaster[field])))
+      input.add(new Option(`Tipo #${disaster[field]} pendiente de consulta`, String(disaster[field])));
+    input.value = field === 'startedAt' && disaster[field] ? new Date(disaster[field]).toISOString().slice(0, 19) : disaster[field] ?? '';
+  }
 }
 try {
   pendingSubmission = JSON.parse(sessionStorage.getItem(submissionStorage) ?? 'null');
@@ -26,13 +31,23 @@ try {
       throw new Error('Identidad pendiente inválida.');
     restoreSubmission();
     retryButton.hidden = false;
-    setStatus(formStatus, 'Hay un envío sin confirmar. Reinténtalo antes de iniciar otra operación.');
+    setStatus(formStatus, pendingSubmission.conflict ? 'Conflicto definitivo: revise y resuelva la operación antes de iniciar otra.' : 'Hay un envío sin confirmar. Reinténtalo antes de iniciar otra operación.');
+    if (pendingSubmission.conflict) retryButton.textContent = 'Resolver conflicto';
   }
 } catch {
   submitButton.disabled = true;
   setStatus(formStatus, 'No se pudo recuperar la operación pendiente. Revisa el almacenamiento de esta pestaña antes de continuar.', true);
 }
 retryButton.addEventListener('click', () => {
+  if (pendingSubmission.conflict) {
+    if (!window.confirm('Esta clave tiene un conflicto definitivo. ¿Descartar su reintento y preparar una nueva operación? El registro del servidor se conserva.')) return;
+    sessionStorage.removeItem(submissionStorage);
+    pendingSubmission = undefined;
+    retryButton.hidden = true;
+    retryButton.textContent = 'Reintentar el envío pendiente';
+    setStatus(formStatus, 'Conflicto resuelto explícitamente. Revise los datos y pulse Registrar para iniciar una nueva operación.');
+    return;
+  }
   restoreSubmission();
   updateSelection();
   form.requestSubmit();
@@ -41,6 +56,33 @@ const colors = ['#27815b', '#738520', '#cb9223', '#d16b30', '#b83d46'];
 let map;
 let markers;
 let selection;
+let disasterTypes = [];
+const transitions = { Detected: ['Registered'], Registered: ['Assessment', 'Response', 'Recovery', 'Closed'],
+  Assessment: ['Response', 'Recovery', 'Closed'], Response: ['Recovery', 'Closed'],
+  Recovery: ['Reconstruction', 'Closed'], Reconstruction: ['Closed'], Closed: [] };
+
+function dateIdentity(value) {
+  if (value == null) return null;
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) return NaN;
+  const fraction = value.match(/\.(\d+)/)?.[1] ?? '';
+  return new Date(value).toISOString().slice(0, 19) + '.' + fraction.padEnd(6, '0').slice(0, 6) + 'Z';
+}
+function creationContent(data, original) {
+  return { nombre: data.get('nombre'), ubicacion: data.get('ubicacion'), severidad: Number(data.get('severidad')),
+    descripcion: data.get('descripcion'), latitud: Number(data.get('latitud')), longitud: Number(data.get('longitud')),
+    radio: data.get('radio') === '' ? null : Number(data.get('radio')),
+    disasterTypeId: data.get('disasterTypeId') ? Number(data.get('disasterTypeId')) : null,
+    startedAt: original?.startedAt && data.get('startedAt') === new Date(original.startedAt).toISOString().slice(0, 19) ? original.startedAt
+      : data.get('startedAt') ? new Date(data.get('startedAt') + 'Z').toISOString() : null,
+    attentionLevel: data.get('attentionLevel') ? Number(data.get('attentionLevel')) : null };
+}
+function sameCreation(left, right) {
+  return ['nombre', 'ubicacion', 'descripcion'].every(field => typeof left[field] === 'string' && typeof right[field] === 'string' && left[field].trim() === right[field].trim())
+    && ['severidad', 'latitud', 'longitud'].every(field => Number.isFinite(left[field]) && left[field] === right[field])
+    && ['radio', 'disasterTypeId', 'attentionLevel'].every(field => (left[field] ?? null) === (right[field] ?? null))
+    && (left.startedAt == null && right.startedAt == null || left.startedAt != null && right.startedAt != null
+      && dateIdentity(left.startedAt) === dateIdentity(right.startedAt));
+}
 
 function setStatus(element, message, isError = false) {
   element.textContent = message;
@@ -84,13 +126,19 @@ longitude.addEventListener('input', updateSelection);
 radius.addEventListener('input', updateSelection);
 
 async function api(path, options) {
-  const response = await (window.platformFetch ?? window.fetch)(`/api/desastres${path}`, options);
+  const endpoint = path.startsWith('/api/') ? path : `/api/desastres${path}`;
+  const response = await (window.platformFetch ?? window.fetch)(endpoint, options);
   if (!response.ok) {
     const problem = await response.json().catch(() => null);
     const messages = problem?.errors ? Object.values(problem.errors).flat().join(' ') : null;
     throw Object.assign(new Error(messages || `No se pudo completar la solicitud (HTTP ${response.status}). Comprueba que la API esté ejecutándose.`), { status: response.status });
   }
-  return response.json();
+  const creation = options?.method === 'POST' && endpoint === '/api/desastres';
+  if (creation && ![200, 201].includes(response.status)) throw new Error('El servidor no confirmó la creación. Se conserva el envío pendiente.');
+  const result = response.status === 204 ? null : await response.json();
+  if (creation && (!Number.isSafeInteger(result?.id) || result.id <= 0 || result.id > 2147483647 || !sameCreation(result, JSON.parse(options.body))))
+    throw new Error('La respuesta no confirma el contenido original. Se conserva el envío pendiente.');
+  return result;
 }
 
 function textElement(tag, text, className) {
@@ -127,6 +175,8 @@ function render(disasters, fitMap) {
     const content = document.createElement('div');
     content.append(textElement('h3', disaster.nombre), textElement('p', disaster.ubicacion),
       textElement('p', disaster.descripcion),
+      textElement('p', `Tipo: ${disasterTypes.find(type => type.id === disaster.disasterTypeId)?.name ?? (disaster.disasterTypeId ?? 'pendiente')} · Atención: ${disaster.attentionLevel ?? 'sin clasificar'} · ${disaster.phase} · v${disaster.version}`),
+      textElement('p', `Inicio UTC: ${disaster.startedAt ?? 'desconocido'} · Registro UTC: ${disaster.registeredAt ?? 'desconocido'} · Actualización UTC: ${disaster.updatedAt ?? 'desconocido'}`),
       textElement('p', `${disaster.latitud.toFixed(6)}, ${disaster.longitud.toFixed(6)}`));
     if (map) {
       const locate = textElement('button', 'Ver en el mapa ↗', 'location-button');
@@ -139,6 +189,7 @@ function render(disasters, fitMap) {
       });
       content.append(locate);
     }
+    appendManagement(content, disaster);
     const severity = textElement('span', `Nivel ${disaster.severidad}`, `severity level-${disaster.severidad}`);
     article.append(content, severity);
     list.append(article);
@@ -167,17 +218,12 @@ form.addEventListener('submit', async event => {
     return;
   }
   if (!form.reportValidity()) return;
-  const data = new FormData(form);
-  const disaster = {
-    nombre: data.get('nombre'), ubicacion: data.get('ubicacion'),
-    severidad: Number(data.get('severidad')), descripcion: data.get('descripcion'),
-    latitud: Number(data.get('latitud')), longitud: Number(data.get('longitud')), radio
-  };
-  const content = JSON.stringify(disaster);
-  if (pendingSubmission && pendingSubmission.content !== content) {
-    setStatus(formStatus, 'El envío anterior sigue sin confirmar. Usa «Reintentar el envío pendiente» antes de iniciar otra operación.', true);
+  const disaster = creationContent(new FormData(form), pendingSubmission ? JSON.parse(pendingSubmission.content) : null);
+  if (pendingSubmission && !sameCreation(disaster, JSON.parse(pendingSubmission.content))) {
+    setStatus(formStatus, 'El envío anterior sigue sin confirmar. Use su acción de reintento o resolución antes de iniciar otra operación.', true);
     return;
   }
+  const content = pendingSubmission?.content ?? JSON.stringify(disaster);
   submitButton.disabled = true;
   setStatus(formStatus, 'Guardando reporte…');
   try {
@@ -207,11 +253,16 @@ form.addEventListener('submit', async event => {
     setStatus(formStatus, `Reporte #${saved.id} registrado correctamente.`);
     await loadDisasters();
   } catch (error) {
+    if (error.status === 409 && pendingSubmission) {
+      pendingSubmission.conflict = true;
+      sessionStorage.setItem(submissionStorage, JSON.stringify(pendingSubmission));
+    }
     if (error.status === 400) {
       sessionStorage.removeItem(submissionStorage);
       pendingSubmission = undefined;
     }
     retryButton.hidden = !pendingSubmission;
+    retryButton.textContent = pendingSubmission?.conflict ? 'Resolver conflicto' : 'Reintentar el envío pendiente';
     setStatus(formStatus, error.message, true);
   } finally {
     submitButton.disabled = false;
@@ -221,3 +272,118 @@ form.addEventListener('submit', async event => {
 
 refreshButton.addEventListener('click', () => loadDisasters());
 loadDisasters();
+
+async function loadTypes() {
+  try {
+    disasterTypes = await api('/api/tipos-desastre');
+    const select = document.querySelector('#disasterTypeId');
+    const selected = select.value;
+    select.replaceChildren(new Option('Pendiente de determinar', ''));
+    for (const type of disasterTypes) if (type.isActive || String(type.id) === selected)
+      select.add(new Option(type.name + (type.isActive ? '' : ' (inactivo)'), String(type.id)));
+    if (selected && !Array.from(select.options).some(option => option.value === selected))
+      select.add(new Option(`Tipo #${selected} pendiente de consulta`, selected));
+    select.value = selected;
+    const list = document.querySelector('#type-list'); list.replaceChildren();
+    for (const type of disasterTypes) {
+      const row = textElement('p', type.name + (type.isActive ? '' : ' · Inactivo'));
+      if (type.isActive) {
+        const button = textElement('button', 'Desactivar', 'secondary'); button.type = 'button';
+        button.addEventListener('click', async () => {
+          button.disabled = true;
+          try {
+            await api(`/api/tipos-desastre/${type.id}/desactivar`, { method: 'PUT' });
+            await loadTypes();
+          } catch (error) { setStatus(document.querySelector('#type-status'), error.message, true); button.disabled = false; }
+        }); row.append(button);
+      }
+      list.append(row);
+    }
+  } catch (error) { setStatus(document.querySelector('#type-status'), error.message, true); }
+}
+
+document.querySelector('#type-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const input = document.querySelector('#type-name');
+  try {
+    await api('/api/tipos-desastre', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: input.value }) });
+    input.value = '';
+    setStatus(document.querySelector('#type-status'), 'Tipo agregado.');
+    await loadTypes();
+  } catch (error) { setStatus(document.querySelector('#type-status'), error.message, true); }
+});
+
+function appendManagement(content, disaster) {
+  const edit = document.createElement('details'); edit.append(textElement('summary', 'Actualizar información'));
+  const editForm = document.createElement('form');
+  for (const [name, label, type, min, max] of [
+    ['nombre', 'Nombre', 'text'], ['ubicacion', 'Ubicación', 'text'], ['descripcion', 'Descripción', 'text'],
+    ['severidad', 'Severidad', 'number', 1, 5], ['latitud', 'Latitud', 'number', -90, 90],
+    ['longitud', 'Longitud', 'number', -180, 180], ['radio', 'Radio (metros)', 'number', 0, 1000000],
+    ['startedAt', 'Inicio UTC', 'datetime-local'], ['disasterTypeId', 'Tipo', 'select'], ['attentionLevel', 'Atención requerida', 'select']]) {
+    const wrapper = textElement('label', label);
+    let field;
+    if (type === 'select') {
+      field = document.createElement('select'); field.add(new Option('Desconocido', ''));
+      const choices = name === 'disasterTypeId' ? disasterTypes.filter(item => item.isActive || item.id === disaster.disasterTypeId).map(item => [item.id, item.name])
+        : [[1, 'Bajo'], [2, 'Medio'], [3, 'Alto'], [4, 'Crítico']];
+      if (name === 'disasterTypeId' && disaster.disasterTypeId != null && !choices.some(([value]) => value === disaster.disasterTypeId))
+        choices.push([disaster.disasterTypeId, `Tipo #${disaster.disasterTypeId} pendiente de consulta`]);
+      for (const [value, text] of choices) field.add(new Option(text, String(value)));
+    } else {
+      field = document.createElement('input'); field.type = type;
+      if (type === 'number') { field.step = name === 'severidad' ? '1' : 'any'; field.min = min; field.max = max; }
+      if (type === 'datetime-local') field.step = '1';
+    }
+    field.name = name;
+    field.value = name === 'startedAt' && disaster[name] ? new Date(disaster[name]).toISOString().slice(0, 19) : disaster[name] ?? '';
+    field.required = ['nombre', 'ubicacion', 'descripcion', 'severidad', 'latitud', 'longitud'].includes(name);
+    if (name === 'nombre') field.maxLength = 120;
+    if (name === 'ubicacion') field.maxLength = 200;
+    if (name === 'descripcion') field.maxLength = 2000;
+    wrapper.append(field); editForm.append(wrapper);
+  }
+  const save = textElement('button', 'Guardar cambios', 'secondary'); save.type = 'submit';
+  const result = textElement('p', '', 'status'); result.setAttribute('role', 'status');
+  editForm.append(save, result);
+  editForm.addEventListener('submit', async event => {
+    event.preventDefault(); save.disabled = true;
+    try {
+      await api(`/${disaster.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...creationContent(new FormData(editForm), disaster), expectedVersion: disaster.version }) });
+      await loadDisasters(false);
+    } catch (error) { setStatus(result, error.message, true); save.disabled = false; }
+  }); edit.append(editForm); content.append(edit);
+  if ((transitions[disaster.phase] ?? []).length) {
+    const phaseDetails = document.createElement('details'); phaseDetails.append(textElement('summary', 'Cambiar fase'));
+    const phaseForm = document.createElement('form'); const phase = document.createElement('select'); phase.name = 'phase';
+    for (const value of transitions[disaster.phase]) phase.add(new Option(value, value));
+    const reasonLabel = textElement('label', 'Justificación (obligatoria en saltos y cierres)');
+    const reason = document.createElement('textarea'); reason.maxLength = 2000; reasonLabel.append(reason);
+    const confirmationLabel = textElement('label', 'Confirmo que no quedan compromisos críticos pendientes, incluidos los de reconstrucción.');
+    const confirmation = document.createElement('input'); confirmation.type = 'checkbox'; confirmationLabel.prepend(confirmation);
+    const send = textElement('button', 'Cambiar fase', 'secondary'); send.type = 'submit'; const status = textElement('p', '', 'status');
+    phaseForm.append(phase, reasonLabel, confirmationLabel, send, status);
+    phaseForm.addEventListener('submit', async event => {
+      event.preventDefault(); send.disabled = true;
+      try {
+        await api(`/${disaster.id}/fase`, { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phase: phase.value, expectedVersion: disaster.version, reason: reason.value,
+            confirmNoCriticalCommitments: confirmation.checked }) });
+        await loadDisasters(false);
+      } catch (error) { setStatus(status, error.message, true); send.disabled = false; }
+    }); phaseDetails.append(phaseForm); content.append(phaseDetails);
+  }
+  const history = document.createElement('details'); history.append(textElement('summary', 'Consultar historial'));
+  const entries = textElement('pre', ''); history.append(entries);
+  history.addEventListener('toggle', async () => {
+    if (!history.open) return;
+    try {
+      const history = await api(`/${disaster.id}/historial`);
+      entries.textContent = JSON.stringify(history.map(entry => ({ ...entry, changes: entry.changes ? JSON.parse(entry.changes) : null })), null, 2);
+    }
+    catch (error) { entries.textContent = error.message; }
+  }); content.append(history);
+}
+
+loadTypes();

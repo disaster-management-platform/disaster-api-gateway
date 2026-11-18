@@ -70,3 +70,6 @@ footer { text-align: center; padding: 30px 24px; color: var(--muted); font-size:
   .workspace { grid-template-columns: 1fr; }.report-panel, .list-panel { padding: 20px; }
   #map { height: 340px; }.map-heading { padding: 16px 16px 0; }.map-hint { padding: 0 16px; }.legend { gap: 12px; padding: 14px 16px; }
 }
+
+.report pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+input[type="checkbox"] { width: auto; margin-right: .5rem; }

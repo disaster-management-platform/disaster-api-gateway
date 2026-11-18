@@ -54,6 +54,8 @@ def free_port():
 
 
 def request(port, path="/api/desastres", method="GET", body=None, headers=None):
+    if method == "PUT" and path.endswith("/fase") and isinstance(body, dict):
+        body = {"reason": "Transición autorizada del escenario Gateway", "confirmNoCriticalCommitments": True, **body}
     values = dict(headers or {})
     if isinstance(body, dict):
         body = json.dumps(body).encode()
@@ -167,11 +169,11 @@ class GatewayTests(unittest.TestCase):
         expanded_body = {**self.report(), "radio": 500}
         status, _, original = request(self.first, method="POST", body=original_body)
         self.assertEqual(201, status)
-        self.assertEqual(set(original_body) | {"id", "radio", "phase", "version"}, set(original))
+        self.assertEqual(set(original_body) | {"id", "radio", "phase", "version", "disasterTypeId", "startedAt", "registeredAt", "updatedAt", "attentionLevel"}, set(original))
         self.assertIsNone(original["radio"])
         status, _, expanded = request(self.second, method="POST", body=expanded_body)
         self.assertEqual(201, status)
-        self.assertEqual(set(expanded_body) | {"id", "phase", "version"}, set(expanded))
+        self.assertEqual(set(expanded_body) | {"id", "phase", "version", "disasterTypeId", "startedAt", "registeredAt", "updatedAt", "attentionLevel"}, set(expanded))
         self.assertIn(expanded_body["nombre"], [d["nombre"] for d in request(self.first)[2]])
         self.assertIn(original_body["nombre"], [d["nombre"] for d in request(self.second)[2]])
         self.assertEqual(original, request(self.second, f"/api/desastres/{original['id']}")[2])
@@ -254,9 +256,9 @@ const api = source.slice(source.indexOf('async function api('), source.indexOf('
         prefix = "/session/" + session
         def script(source, *args):
             return webdriver("POST", prefix + "/execute/sync", {"script": source, "args": list(args)})
-        def wait_script(source):
+        def wait_script(source, *args):
             deadline = time.monotonic() + 20
-            while not script(source):
+            while not script(source, *args):
                 if time.monotonic() > deadline:
                     self.fail("El navegador no confirmó: " + source)
                 time.sleep(.1)
@@ -290,6 +292,7 @@ document.querySelector('#submit').click();
             self.assertEqual(name, script("return document.querySelector('#nombre').value"))
             script("""
 window.submissions = [arguments[0]];
+window.originalPlatformFetch = window.platformFetch;
 const send = window.platformFetch;
 window.platformFetch = async (path, options = {}) => {
   const response = await send(path, options);
@@ -320,6 +323,90 @@ document.querySelector('#submit').click();
             unknown = next(d for d in request(self.second)[2] if d["nombre"] == name + " unknown")
             self.assertIsNone(unknown["radio"])
             self.assertTrue(script("return window.eval(arguments[0])", "markers.getLayers().some(layer => !(layer instanceof L.Circle) && layer.getPopup().getContent().textContent.includes(" + json.dumps(name + " unknown") + "))"))
+            script("window.platformFetch = window.originalPlatformFetch")
+            conflict_body = {**self.report(name + " conflict"), "radio": None}
+            conflict_key = str(uuid.uuid4())
+            self.assertEqual(201, request(self.first, method="POST", body={**conflict_body, "descripcion": "Ya registrado"},
+                headers={"Idempotency-Key": conflict_key})[0])
+            script("sessionStorage.setItem('disaster-pending-submission', JSON.stringify(arguments[0]))",
+                {"key": conflict_key, "content": json.dumps(conflict_body, separators=(",", ":"))})
+            webdriver("POST", prefix + "/url", {"url": f"http://127.0.0.1:{self.first}/"})
+            wait_script("return !document.querySelector('#refresh').disabled")
+            script("document.querySelector('#form-status + button').click()")
+            wait_script("return JSON.parse(sessionStorage.getItem('disaster-pending-submission')).conflict === true")
+            self.assertEqual(conflict_key, script("return JSON.parse(sessionStorage.getItem('disaster-pending-submission')).key"))
+            script("document.querySelector('#form-status + button').click()")
+            webdriver("POST", prefix + "/alert/accept", {})
+            self.assertIsNone(script("return sessionStorage.getItem('disaster-pending-submission')"))
+            script("document.querySelector('#submit').click()")
+            wait_script("return document.querySelector('#form-status').textContent.includes('registrado correctamente') && !document.querySelector('#refresh').disabled")
+            self.assertEqual(2, len([item for item in request(self.first)[2] if item["nombre"] == conflict_body["nombre"]]))
+            for fault in ["id", "nombre"]:
+                operation_name = name + " invalid " + fault
+                script("""
+window.originalPlatformFetch = window.platformFetch;
+window.platformFetch = async (path, options = {}) => {
+  const response = await originalPlatformFetch(path, options);
+  if (options.method === 'POST' && path === '/api/desastres') {
+    const body = await response.json(); body[arguments[0]] = arguments[0] === 'id' ? 0 : 'Incompatible';
+    return new Response(JSON.stringify(body), {status: response.status, headers: {'Content-Type': 'application/json'}});
+  }
+  return response;
+};
+document.querySelector('#disaster-form').reset();
+for (const [field, value] of Object.entries({nombre: arguments[1], ubicacion:'Bogotá', severidad:'4',
+  descripcion:'Prueba web', latitud:'4.7', longitud:'-74', radio:'321.5'})) document.getElementById(field).value = value;
+document.querySelector('#submit').click();
+""", fault, operation_name)
+                wait_script("return document.querySelector('#form-status').textContent.includes('no confirma el contenido original')")
+                pending = script("return JSON.parse(sessionStorage.getItem('disaster-pending-submission'))")
+                webdriver("POST", prefix + "/url", {"url": f"http://127.0.0.1:{self.first}/"})
+                wait_script("return !document.querySelector('#refresh').disabled")
+                self.assertEqual(pending["key"], script("return JSON.parse(sessionStorage.getItem('disaster-pending-submission')).key"))
+                script("document.querySelector('#form-status + button').click()")
+                wait_script("return document.querySelector('#form-status').textContent.includes('registrado correctamente') && !document.querySelector('#refresh').disabled")
+                self.assertEqual(1, len([item for item in request(self.first)[2] if item["nombre"] == operation_name]))
+            type_name = name + " type"
+            script("document.querySelector('#type-name').value = arguments[0]; document.querySelector('#type-form button').click()", type_name)
+            wait_script("return document.querySelector('#type-status').textContent === 'Tipo agregado.'")
+            wait_script("return Array.from(document.querySelector('#disasterTypeId').options).some(option => option.textContent === arguments[0])", type_name)
+            type_id = script("return Array.from(document.querySelector('#disasterTypeId').options).find(option => option.textContent === arguments[0]).value", type_name)
+            managed_name = name + " managed"
+            script("""
+for (const [field, value] of Object.entries({nombre: arguments[0], ubicacion:'Bogotá', severidad:'5',
+  descripcion:'Administración web', latitud:'4.7', longitud:'-74', radio:'1100', disasterTypeId:arguments[1],
+  startedAt:'2026-11-17T12:00:00', attentionLevel:'1'})) document.getElementById(field).value = value;
+document.querySelector('#submit').click();
+""", managed_name, type_id)
+            wait_script("return document.querySelector('#form-status').textContent.includes('registrado correctamente') && !document.querySelector('#refresh').disabled")
+            managed = next(item for item in request(self.first)[2] if item["nombre"] == managed_name)
+            self.assertEqual(int(type_id), managed["disasterTypeId"])
+            script("""
+const article = Array.from(document.querySelectorAll('.report')).find(node => node.querySelector('h3').textContent === arguments[0]);
+const details = article.querySelector('details'); details.open = true;
+const edit = details.querySelector('form'); edit.elements.namedItem('nombre').value = arguments[0] + ' updated';
+edit.elements.namedItem('attentionLevel').value = '4'; edit.querySelector('button').click();
+""", managed_name)
+            wait_script("return Array.from(document.querySelectorAll('.report h3')).some(node => node.textContent === arguments[0])", managed_name + " updated")
+            current = request(self.first, f"/api/desastres/{managed['id']}")[2]
+            self.assertEqual(2, current["version"]); self.assertEqual(4, current["attentionLevel"])
+            script("""
+const article = Array.from(document.querySelectorAll('.report')).find(node => node.querySelector('h3').textContent === arguments[0]);
+const details = article.querySelectorAll('details')[1]; details.open = true;
+const phase = details.querySelector('form'); phase.querySelector('select').value = 'Closed';
+phase.querySelector('textarea').value = 'Cierre autorizado sin compromisos críticos pendientes';
+phase.querySelector('input[type=checkbox]').checked = true; phase.querySelector('button').click();
+""", managed_name + " updated")
+            wait_script("const article = Array.from(document.querySelectorAll('.report')).find(node => node.querySelector('h3').textContent === arguments[0]); return article && Array.from(article.querySelectorAll('p')).some(node => node.textContent.includes(' · Closed · v3'));", managed_name + " updated")
+            closed = request(self.first, f"/api/desastres/{managed['id']}")[2]; self.assertEqual("Closed", closed["phase"])
+            script("""
+const article = Array.from(document.querySelectorAll('.report')).find(node => node.querySelector('h3').textContent === arguments[0]);
+article.querySelector('details:last-child').open = true;
+""", managed_name + " updated")
+            wait_script("return document.querySelector('#disaster-list').textContent.includes('commitmentsConfirmed')")
+            script("Array.from(document.querySelectorAll('#type-list p')).find(node => node.textContent.includes(arguments[0])).querySelector('button').click()", type_name)
+            wait_script("return Array.from(document.querySelectorAll('#type-list p')).some(node => node.textContent.includes(arguments[0]) && node.textContent.includes('Inactivo'))", type_name)
+            self.assertEqual(int(type_id), request(self.first, f"/api/desastres/{managed['id']}")[2]["disasterTypeId"])
             for page in ["reconstruction.html", "access.html", "monitoring.html", "formalization.html", "final-report.html"]:
                 webdriver("POST", prefix + "/url", {"url": f"http://127.0.0.1:{self.second}/{page}"})
                 self.assertTrue(script("return !!document.querySelector('main')"))

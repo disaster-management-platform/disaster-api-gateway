@@ -21,11 +21,25 @@
       <div><p class="eyebrow">OBSERVA · UBICA · REGISTRA</p><h1 id="title">Cada reporte cuenta.</h1><p>Registra un desastre y consulta su ubicación en el mapa.</p></div>
       <div class="total"><strong id="count">0</strong><span>desastres registrados</span></div>
     </section>
+    <details class="panel"><summary>Administrar tipos de desastre</summary>
+      <p class="muted">La administración requiere el permiso disasters.admin.</p>
+      <form id="type-form"><label for="type-name">Nuevo tipo</label><input id="type-name" name="name" required maxlength="120">
+        <button type="submit" class="secondary">Agregar tipo</button></form>
+      <p id="type-status" class="status" role="status"></p><div id="type-list"></div>
+    </details>
     <div class="workspace">
       <section class="panel report-panel" aria-labelledby="form-title">
         <div class="section-heading"><span class="step">01</span><h2 id="form-title">Registrar desastre</h2></div>
         <p class="muted">Completa los campos obligatorios para agregar un reporte.</p>
         <form id="disaster-form">
+          <label for="disasterTypeId">Tipo de desastre (opcional)</label>
+          <select id="disasterTypeId" name="disasterTypeId"><option value="">Pendiente de determinar</option></select>
+          <label for="startedAt">Fecha y hora de inicio UTC (opcional)</label>
+          <input id="startedAt" name="startedAt" type="datetime-local" step="1">
+          <label for="attentionLevel">Atención requerida (independiente de severidad)</label>
+          <select id="attentionLevel" name="attentionLevel"><option value="">Sin clasificar</option>
+            <option value="1">Nivel 1 · Bajo</option><option value="2">Nivel 2 · Medio</option>
+            <option value="3">Nivel 3 · Alto</option><option value="4">Nivel 4 · Crítico</option></select>
           <label for="nombre">Nombre</label>
           <input id="nombre" name="nombre" required maxlength="120" placeholder="Ej. Inundación del río Bogotá">
           <label for="ubicacion">Ubicación</label>
