@@ -659,5 +659,27 @@ Array.from(article.querySelectorAll('details')).find(item => item.querySelector(
         self.assertEqual(hashlib.sha256(data).digest(), hashlib.sha256(downloaded).digest())
 
 
+class EvidenceRoutingTests(unittest.TestCase):
+    def test_explicit_evidence_routes_reach_the_existing_cluster(self):
+        routes=json.loads((GATEWAY / "appsettings.json").read_text())["ReverseProxy"]["Routes"]
+        expected={"evidence-collection":["GET","POST"],"evidence-detail":["GET"],"evidence-confirm":["POST"],"evidence-download":["GET"]}
+        for name,methods in expected.items():
+            self.assertEqual(methods,routes[name]["Match"]["Methods"])
+            self.assertEqual("damage-assessment-api",routes[name]["ClusterId"])
+            self.assertNotIn("**",routes[name]["Match"]["Path"])
+        port=free_port()
+        with tempfile.TemporaryFile() as log:
+            process=subprocess.Popen(["dotnet",str(GATEWAY / "bin/Debug/net10.0/DisasterLocation.Gateway.dll"),"--urls",f"http://127.0.0.1:{port}"],cwd=GATEWAY,
+                env={**os.environ,"ASPNETCORE_ENVIRONMENT":"Development","ReverseProxy__Clusters__damage-assessment-api__Destinations__local__Address":"http://127.0.0.1:8170/"},stdout=log,stderr=log)
+            try:
+                wait_ready(port,"/health",process)
+                path=f"/api/evaluaciones/{uuid.uuid4()}/evidencias"
+                for suffix,method in [("","GET"),("","POST"),(f"/{uuid.uuid4()}","GET"),(f"/{uuid.uuid4()}/confirmar","POST"),(f"/{uuid.uuid4()}/descarga","GET")]:
+                    self.assertEqual(401,request(port,path+suffix,method)[0])
+                self.assertEqual(404,request(port,path+"/internal-storage-key")[0])
+            finally:
+                process.terminate();process.wait(timeout=10)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
