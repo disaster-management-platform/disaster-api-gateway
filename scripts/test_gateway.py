@@ -662,7 +662,7 @@ Array.from(article.querySelectorAll('details')).find(item => item.querySelector(
 class EvidenceRoutingTests(unittest.TestCase):
     def test_explicit_evidence_routes_reach_the_existing_cluster(self):
         routes=json.loads((GATEWAY / "appsettings.json").read_text())["ReverseProxy"]["Routes"]
-        expected={"evidence-collection":["GET","POST"],"evidence-detail":["GET"],"evidence-confirm":["POST"],"evidence-download":["GET"]}
+        expected={"evidence-collection":["GET","POST"],"evidence-detail":["GET"],"evidence-confirm":["POST"],"evidence-download":["GET"],"assessment-batch":["POST"],"assessment-sync":["GET"]}
         for name,methods in expected.items():
             self.assertEqual(methods,routes[name]["Match"]["Methods"])
             self.assertEqual("damage-assessment-api",routes[name]["ClusterId"])
@@ -676,6 +676,8 @@ class EvidenceRoutingTests(unittest.TestCase):
                 path=f"/api/evaluaciones/{uuid.uuid4()}/evidencias"
                 for suffix,method in [("","GET"),("","POST"),(f"/{uuid.uuid4()}","GET"),(f"/{uuid.uuid4()}/confirmar","POST"),(f"/{uuid.uuid4()}/descarga","GET")]:
                     self.assertEqual(401,request(port,path+suffix,method)[0])
+                self.assertEqual(401,request(port,"/api/evaluaciones/batch","POST",{"operations":[]})[0])
+                self.assertEqual(401,request(port,"/api/evaluaciones/sync")[0])
                 self.assertEqual(404,request(port,path+"/internal-storage-key")[0])
             finally:
                 process.terminate();process.wait(timeout=10)

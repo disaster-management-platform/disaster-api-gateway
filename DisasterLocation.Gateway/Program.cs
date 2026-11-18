@@ -75,6 +75,7 @@ builder.Services.AddRateLimiter(options =>
     options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(context =>
         RateLimitPartition.GetConcurrencyLimiter(
             context.Request.Path.StartsWithSegments("/api/desastres/batch") || context.Request.Path.StartsWithSegments("/api/desastres/sync")
+                || context.Request.Path.StartsWithSegments("/api/evaluaciones/batch") || context.Request.Path.StartsWithSegments("/api/evaluaciones/sync")
                 ? "synchronization" : "gateway", key => new ConcurrencyLimiterOptions
         {
             PermitLimit = key == "synchronization" ? configuration.GetValue<int>("Traffic:SyncConcurrentRequests", 2)
