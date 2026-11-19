@@ -28,6 +28,21 @@ class IntegrationRoutes(unittest.TestCase):
         self.assertTrue(all(r["MaxRequestBodySize"] <= 262144 and r["RateLimiterPolicy"] == "api" for r in routes))
         self.assertEqual("/api/integracion/diagnostico/ready", proxy["Clusters"]["integration-api"]["HealthCheck"]["Active"]["Path"])
 
+    def test_disaster_suggestions_and_manual_reports(self):
+        root = Path(__file__).resolve().parents[1]
+        routes = json.loads((root / "DisasterLocation.Gateway/appsettings.json").read_text())["ReverseProxy"]["Routes"]
+        for name, path, methods in [
+            ("disaster-suggestions", "/api/desastres/coincidencias", {"GET"}),
+            ("disaster-reports", "/api/desastres/{id:int}/reportes", {"GET", "POST"}),
+        ]:
+            route = routes[name]
+            self.assertEqual("disasters-api", route["ClusterId"])
+            self.assertEqual(path, route["Match"]["Path"])
+            self.assertEqual(methods, set(route["Match"]["Methods"]))
+            self.assertEqual("api", route["RateLimiterPolicy"])
+            self.assertEqual("00:00:30", route["Timeout"])
+        self.assertEqual(65536, routes["disaster-reports"]["MaxRequestBodySize"])
+
 
 if __name__ == "__main__":
     unittest.main()
