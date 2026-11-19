@@ -110,7 +110,7 @@ class GatewayTests(unittest.TestCase):
             "ConnectionStrings__Disasters": connection, "Security__LocalDemo": "true"}, "/api/desastres")
         common = {"ConnectionStrings__Disasters": connection,
                   "Security__LocalDemo": "true", "Messaging__Enabled": "false",
-                  "Reconstruction__DemoExternalData": "true", "Attachments__Directory": str(cls.folder / "attachments")}
+                  "Reconstruction__DemoExternalData": "true", "Attachments__LocalDevelopment": "true", "Attachments__Directory": str(cls.folder / "attachments")}
         common["ExternalApis__Disasters"] = f"http://127.0.0.1:{cls.disaster_api}/"
         cls.reconstruction_api, _, _ = cls.start(RECONSTRUCTION / "Reconstruction.Api", common, "/api/reconstruccion/health")
         cls.secure_api, cls.secure_process, _ = cls.start(RECONSTRUCTION / "Reconstruction.Api",
@@ -662,7 +662,7 @@ Array.from(article.querySelectorAll('details')).find(item => item.querySelector(
 class EvidenceRoutingTests(unittest.TestCase):
     def test_explicit_evidence_routes_reach_the_existing_cluster(self):
         routes=json.loads((GATEWAY / "appsettings.json").read_text())["ReverseProxy"]["Routes"]
-        expected={"evidence-collection":["GET","POST"],"evidence-detail":["GET"],"evidence-confirm":["POST"],"evidence-download":["GET"],"assessment-batch":["POST"],"assessment-sync":["GET"]}
+        expected={"evidence-collection":["GET","POST"],"evidence-detail":["GET"],"evidence-confirm":["POST"],"evidence-download":["GET"],"assessment-batch":["POST"],"assessment-sync":["GET"],"assessment-state":["PUT"],"assessment-revision":["POST"],"assessment-history":["GET"]}
         for name,methods in expected.items():
             self.assertEqual(methods,routes[name]["Match"]["Methods"])
             self.assertEqual("damage-assessment-api",routes[name]["ClusterId"])
@@ -670,7 +670,7 @@ class EvidenceRoutingTests(unittest.TestCase):
         port=free_port()
         with tempfile.TemporaryFile() as log:
             process=subprocess.Popen(["dotnet",str(GATEWAY / "bin/Debug/net10.0/DisasterLocation.Gateway.dll"),"--urls",f"http://127.0.0.1:{port}"],cwd=GATEWAY,
-                env={**os.environ,"ASPNETCORE_ENVIRONMENT":"Development","ReverseProxy__Clusters__damage-assessment-api__Destinations__local__Address":"http://127.0.0.1:8170/"},stdout=log,stderr=log)
+                env={**os.environ,"ASPNETCORE_ENVIRONMENT":"Development","ReverseProxy__Clusters__damage-assessment-api__Destinations__local__Address":os.environ.get("DAMAGE_TEST_URL","http://127.0.0.1:8170/").rstrip("/")+"/"},stdout=log,stderr=log)
             try:
                 wait_ready(port,"/health",process)
                 path=f"/api/evaluaciones/{uuid.uuid4()}/evidencias"
@@ -678,9 +678,33 @@ class EvidenceRoutingTests(unittest.TestCase):
                     self.assertEqual(401,request(port,path+suffix,method)[0])
                 self.assertEqual(401,request(port,"/api/evaluaciones/batch","POST",{"operations":[]})[0])
                 self.assertEqual(401,request(port,"/api/evaluaciones/sync")[0])
+                for suffix,method in [("estado","PUT"),("revisiones","POST"),("historial","GET")]:
+                    self.assertEqual(401,request(port,f"/api/evaluaciones/{uuid.uuid4()}/{suffix}",method,{} if method!="GET" else None)[0])
                 self.assertEqual(404,request(port,path+"/internal-storage-key")[0])
             finally:
                 process.terminate();process.wait(timeout=10)
+
+
+class IntegrationRoutingTests(unittest.TestCase):
+    def test_explicit_people_and_organization_routes(self):
+        destination=os.environ["INTEGRATION_TEST_URL"].removesuffix("/api")+"/"
+        token=os.environ["INTEGRATION_TEST_TOKEN"]
+        person=os.environ["INTEGRATION_TEST_PERSON_ID"]
+        port=free_port()
+        with tempfile.TemporaryFile() as log:
+            env={**os.environ,"ASPNETCORE_ENVIRONMENT":"Development","ASPNETCORE_URLS":f"http://127.0.0.1:{port}","AllowedHosts":"localhost;127.0.0.1","ReverseProxy__Clusters__integration-api__Destinations__local__Address":destination}
+            process=subprocess.Popen(["dotnet",str(GATEWAY/"bin/Debug/net10.0/DisasterLocation.Gateway.dll")],cwd=GATEWAY,env=env,stdout=log,stderr=log)
+            try:
+                wait_ready(port,"/",process)
+                headers={"Authorization":"Bearer "+token}
+                for path in ["/api/organizaciones","/api/personas-afectadas","/api/personas-afectadas/resumen",f"/api/personas-afectadas/{person}"]:
+                    self.assertEqual(200,request(port,path,headers=headers)[0],path)
+                    self.assertEqual(403,request(port,path)[0],path)
+                self.assertEqual(403,request(port,"/api/personas-afectadas","POST",{},headers)[0])
+                self.assertEqual(403,request(port,f"/api/personas-afectadas/{person}","PUT",{},headers)[0])
+                self.assertEqual(404,request(port,"/api/integracion/diagnostico/live")[0])
+                self.assertEqual(404,request(port,"/api/eden/pr/person")[0])
+            finally:process.terminate();process.wait(timeout=10)
 
 
 if __name__ == "__main__":
