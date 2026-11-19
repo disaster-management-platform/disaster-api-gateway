@@ -16,6 +16,7 @@ class IntegrationRoutes(unittest.TestCase):
             "/api/personas-afectadas/resumen": {"GET"},
             "/api/personas-afectadas": {"GET", "POST"},
             "/api/personas-afectadas/{id:long}": {"GET", "PUT"},
+            "/api/personas-afectadas/{id:long}/vincular": {"POST"},
             "/api/coordinacion/tareas": {"GET", "POST"},
             "/api/coordinacion/tareas/{id:long}": {"PUT"},
             "/api/coordinacion/actividades": {"GET", "POST"},
